@@ -73,6 +73,26 @@ class GUITray(TypedDict):
     quit: str
 
 
+class GUIAccounts(TypedDict):
+    name: str
+    default: str
+    error: str
+    in_use: str
+    already_running: str
+    manage: str
+    list: str
+    add: str
+    remove: str
+    enable: str
+    disable: str
+    close: str
+    restart_hint: str
+    invalid: str
+    empty: str
+    confirm_remove: str
+    last_account: str
+
+
 class GUILoginForm(TypedDict):
     name: str
     labels: str
@@ -217,6 +237,7 @@ class GUIMessages(TypedDict):
     status: GUIStatus
     tabs: GUITabs
     tray: GUITray
+    accounts: GUIAccounts
     login: GUILoginForm
     websocket: GUIWebsocket
     progress: GUIProgress
@@ -302,6 +323,25 @@ default_translation: Translation = {
             "minimize": "Minimize to Tray",
             "show": "Show",
             "quit": "Quit",
+        },
+        "accounts": {
+            "name": "Accounts",
+            "default": "Main Account",
+            "error": "Account error",
+            "in_use": "Account {name} is already in use by another instance - skipping it.",
+            "already_running": "Account {name} is already running.",
+            "manage": "Manage accounts",
+            "list": "Configured accounts:",
+            "add": "Add account",
+            "remove": "Remove",
+            "enable": "Enabled",
+            "disable": "Disabled",
+            "close": "Close",
+            "restart_hint": "Changes take effect after restarting the program.",
+            "invalid": "Invalid account name. Use 1-32 letters, digits, spaces, hyphens or underscores.",
+            "empty": "Enter an account name first.",
+            "confirm_remove": "Remove account {name}? Its saved login and settings will be deleted.",
+            "last_account": "At least one account has to remain configured.",
         },
         "login": {
             "name": "Login Form",
