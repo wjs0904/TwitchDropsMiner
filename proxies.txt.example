@@ -21,11 +21,16 @@
 # In Clash Verge, put that in the Merge template of the active profile. Editing
 # config.yaml directly does nothing useful - it is regenerated.
 #
-# Lines starting with # are ignored. Blank lines are ignored.
-# A line without a scheme is treated as http://host:port.
+# A node whose name contains "Fixed" still is not guaranteed a unique exit.
+# Verify with `curl -x http://127.0.0.1:PORT https://api.ipify.org` for every
+# port and drop the ones that answer with a duplicate address.
 
 127.0.0.1:7901
 127.0.0.1:7902
 127.0.0.1:7903
 127.0.0.1:7904
 127.0.0.1:7905
+127.0.0.1:7906
+127.0.0.1:7907
+127.0.0.1:7908
+

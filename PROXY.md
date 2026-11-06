@@ -57,6 +57,51 @@ Clash Verge 里改 **当前订阅的 Merge 模板**（配置页 → 该订阅 �
 把上面的 `listeners` 贴进去。直接改 `config.yaml` 没用，它是运行时生成的产物，
 重新应用配置就会被覆盖。
 
+### 1.1 GLaDOS 订阅的实测出口表
+
+当前订阅（`update.glados-config.com/mihomo/624372/...`）共 29 个节点，其中固定 IP
+的是 `US/TW/JP-Fixed-01..03` 九个。逐个挂到 listener 上实测（`api.ipify.org`，
+每口连测 3 轮，结果稳定）：
+
+| 端口 | 节点 | 出口 IP |
+|---|---|---|
+| 7901 | US-Fixed-01 | 134.195.101.126 |
+| 7902 | TW-Fixed-01 | 210.61.187.237 |
+| 7903 | JP-Fixed-01 | 203.190.1.52 |
+| 7904 | US-Fixed-02 | 134.195.101.222 |
+| 7905 | TW-Fixed-02 | 60.249.35.95 |
+| 7906 | US-Fixed-03 | 134.195.101.62 |
+| 7907 | TW-Fixed-03 | 211.72.214.21 |
+| 7908 | JP-Fixed-03 | 203.190.1.12 |
+
+**`JP-Fixed-02` 不在池里**，且不该加回来。它解析到 `203.190.1.51/.53`，和
+`JP-Fixed-01`（`203.190.1.50/.53`）共用 `.53` 这台，实测两者出口都是
+`203.190.1.52` —— 同时启用会让两个账户共用一个出口，分流反而破了。
+
+**节点名字里带 `Fixed` 不等于出口唯一**，换订阅后必须重跑一次出口实测，
+把撞 IP 的口删掉。测法：
+
+```bash
+for p in 7901 7902 7903; do
+  echo "$p -> $(curl -s -m 25 -x http://127.0.0.1:$p https://api.ipify.org)"
+done
+```
+
+也可以直接在界面里点「检测出口 IP」，它会按 IP 分组，重复的标红。
+
+### 1.2 让 mihomo 重新读 listeners
+
+mihomo 只在启动时读 `listeners`，`PATCH /configs` 改不动它。改完 Merge 模板后：
+
+- **正常路径**：Clash Verge 里重新应用一次该订阅（或重启 Verge），它会重新生成配置并拉起核心。
+- **API 路径**（Verge 的配置文件写到一半时用）：
+  `PUT /configs?force=true`，body 是 `{"payload": "<完整 yaml>"}`。
+  注意这是**全量替换**，payload 里必须同时含 `proxies`/`proxy-groups`/`rules`
+  （即订阅内容）和 `listeners`。只贴 `config.yaml` 的内容会把节点表清空，
+  `/proxies` 会塌成 7 个内置项。
+  `{"path": "..."}` 形式在用户名含中文时不可用：mihomo 收到的是乱码路径，
+  会被 SAFE_PATHS 检查拒绝。
+
 ### 2. 写代理池
 
 把 `proxies.txt.example` 复制成 `proxies.txt`（放在程序同目录），一行一个：
