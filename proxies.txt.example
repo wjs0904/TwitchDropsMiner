@@ -6,15 +6,26 @@
 # comes to automated account checks.
 #
 # Copy this file to `proxies.txt` next to the program and fill in your ports.
-# With Clash / mihomo, give each account its own mixed-port listener, e.g.:
 #
-#   mixed-port: 7897   -> account 1
-#   listeners: [{name: p2, port: 7898, type: mixed}]
-#   listeners: [{name: p3, port: 7899, type: mixed}]
+# With Clash / mihomo, a port alone does not give you a different exit: every
+# connection through any mixed-port still leaves through whatever the rules
+# pick, so N ports share one IP. What pins an exit is the `proxy` field of a
+# listener - that inbound uses it directly and skips the rules. Add one
+# listener per account, with a FIXED-IP node (not url-test/load-balance, those
+# drift), on ports clear of the ones Clash Verge manages (7897/7898/7899):
+#
+#   listeners:
+#     - {name: acct-1, type: mixed, port: 7901, proxy: US-Fixed-01, udp: true}
+#     - {name: acct-2, type: mixed, port: 7902, proxy: TW-Fixed-01, udp: true}
+#
+# In Clash Verge, put that in the Merge template of the active profile. Editing
+# config.yaml directly does nothing useful - it is regenerated.
 #
 # Lines starting with # are ignored. Blank lines are ignored.
 # A line without a scheme is treated as http://host:port.
 
-127.0.0.1:7897
-127.0.0.1:7898
-127.0.0.1:7899
+127.0.0.1:7901
+127.0.0.1:7902
+127.0.0.1:7903
+127.0.0.1:7904
+127.0.0.1:7905

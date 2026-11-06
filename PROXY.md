@@ -24,36 +24,47 @@
 ### 1. 让每个账户有自己的端口
 
 本分支假定你用 Clash / mihomo 之类支持多监听口的代理软件。
-单个 `mixed-port` 对整台机器只有一个出口 IP，那样分流就是无效的 ——
-实测你的机器上只有 `7897` 在监听，因此需要再加监听。
+单个 `mixed-port` 对整台机器只有一个出口 IP，那样分流就是无效的。
 
-mihomo 配置片段：
+**端口本身不产生不同出口。** 这条最容易踩：给 mihomo 多开几个
+`mixed-port` 或打开 `socks-port`/`port`，所有连接的出口仍由规则决定，
+多个端口依旧是同一个 IP。真正决定出口的是 `listeners` 里的 `proxy` 字段
+——它是该 inbound 的**固定出口**，不参与规则匹配。
 
 ```yaml
-mixed-port: 7897            # 账户 1 用这个
-
 listeners:
-  - name: acct2
+  - name: acct-1
     type: mixed
-    port: 7898
-    proxy: DIRECT            # 或指向某个节点组
-  - name: acct3
+    port: 7901
+    proxy: US-Fixed-01       # 必须是当前订阅里存在的节点或组名
+    udp: true
+  - name: acct-2
     type: mixed
-    port: 7899
-    proxy: DIRECT
+    port: 7902
+    proxy: TW-Fixed-01
+    udp: true
 ```
 
-只想用不同节点而不改端口的话，也可以在 Clash 里为每个端口配不同的
-`proxy-group`，出口 IP 就会不同。
+三条要点：
+
+- `proxy` 填**固定 IP 节点**，不要填 `url-test`/`load-balance` 组，
+  否则出口会漂移，分流又失效了
+- 端口避开 Clash Verge 自己管理的 `7897`（mixed）/`7898`（socks）/`7899`（http），
+  否则重启后会被 GUI 的设置覆盖
+- `proxy: DIRECT` 等于直连，会暴露真实 IP —— 不要照着抄
+
+Clash Verge 里改 **当前订阅的 Merge 模板**（配置页 → 该订阅 → 右键 → 编辑 Merge），
+把上面的 `listeners` 贴进去。直接改 `config.yaml` 没用，它是运行时生成的产物，
+重新应用配置就会被覆盖。
 
 ### 2. 写代理池
 
 把 `proxies.txt.example` 复制成 `proxies.txt`（放在程序同目录），一行一个：
 
 ```
-127.0.0.1:7897
-127.0.0.1:7898
-127.0.0.1:7899
+127.0.0.1:7901
+127.0.0.1:7902
+127.0.0.1:7903
 ```
 
 - `#` 开头是注释，空行忽略
