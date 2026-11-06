@@ -28,7 +28,15 @@ if __name__ == "__main__":
     from version import __version__
     from exceptions import CaptchaRequired
     from utils import lock_file, resource_path, set_root_icon
-    from constants import LOGGING_LEVELS, SELF_PATH, FILE_FORMATTER, LOG_PATH, LOCK_PATH
+    from constants import LOGGING_LEVELS, SELF_PATH, FILE_FORMATTER
+    from accounts import (
+        AccountEntry,
+        AccountRuntime,
+        DEFAULT_ACCOUNT,
+        CURRENT_ACCOUNT,
+        load_registry,
+    )
+    from shell import MinerShell
 
     if TYPE_CHECKING:
         from _typeshed import SupportsWrite
@@ -45,6 +53,22 @@ if __name__ == "__main__":
     # XWayland/Mutter lockups during heavy Tkinter layout updates.
     if sys.platform.startswith("linux") and "XMODIFIERS" not in os.environ:
         os.environ["XMODIFIERS"] = "@im=none"
+
+    class _AccountFilter(logging.Filter):
+        """
+        Keeps a per-account log file free of other accounts' records.
+
+        Records emitted outside any account task (startup, shell, shutdown) are
+        broadcast, which is why the `not current` case passes.
+        """
+
+        def __init__(self, account: str) -> None:
+            super().__init__()
+            self._account = account
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            current = CURRENT_ACCOUNT.get()
+            return not current or current == self._account
 
     class Parser(argparse.ArgumentParser):
         def __init__(self, *args, **kwargs) -> None:
@@ -125,8 +149,8 @@ if __name__ == "__main__":
         settings = Settings(args)
     except Exception:
         messagebox.showerror(
-            "Settings error",
-            f"There was an error while loading the settings file:\n\n{traceback.format_exc()}"
+            _("gui", "accounts", "error"),
+            "载入设置文件时出错：\n\n" + traceback.format_exc(),
         )
         sys.exit(4)
     # dummy window isn't needed anymore
@@ -135,8 +159,19 @@ if __name__ == "__main__":
     del root, parser
 
     # client run
-    async def main():
-        # set language
+    async def main() -> None:
+        # An absent registry means "plain single-account install": behave exactly
+        # like the upstream build, straight out of the working directory.
+        entries = load_registry()
+        if not entries:
+            entries = [AccountEntry(DEFAULT_ACCOUNT)]
+        runtimes = [AccountRuntime(entry, args) for entry in entries]
+
+        # Language and log levels are process-wide, so the first account decides.
+        primary = runtimes[0]
+        primary.build()
+        settings = primary.settings
+
         try:
             _.set_language(settings.language)
         except ValueError:
@@ -145,64 +180,113 @@ if __name__ == "__main__":
 
         # handle logging stuff
         if settings.logging_level > logging.DEBUG:
-            # redirect the root logger into a NullHandler, effectively ignoring all logging calls
-            # that aren't ours. This always runs, unless the main logging level is DEBUG or lower.
+            # redirect the root logger into a NullHandler, effectively ignoring
+            # all logging calls that aren't ours.
             logging.getLogger().addHandler(logging.NullHandler())
         logger = logging.getLogger("TwitchDrops")
         logger.setLevel(settings.logging_level)
-        if settings.log:
-            handler = logging.FileHandler(LOG_PATH)
-            handler.setFormatter(FILE_FORMATTER)
-            logger.addHandler(handler)
         logging.getLogger("TwitchDrops.gql").setLevel(settings.debug_gql)
         logging.getLogger("TwitchDrops.websocket").setLevel(settings.debug_ws)
 
-        exit_status = 0
-        client = Twitch(settings)
+        # remaining accounts construct their own Settings + client
+        for runtime in runtimes[1:]:
+            runtime.build()
+
+        # One lock file per account. Besides keeping two copies of the whole
+        # program from fighting over the same files, this also skips an account
+        # that is already running in another instance.
+        locks = []
+        active: list[AccountRuntime] = []
+        for runtime in runtimes:
+            success, file = lock_file(runtime.paths.lock)
+            if not success:
+                logger.warning(_("gui", "accounts", "in_use").format(name=runtime.name))
+                continue
+            locks.append(file)
+            active.append(runtime)
+        if not active:
+            sys.exit(3)
+
+        # per-account log files, filtered by the account context variable
+        handlers: list[logging.Handler] = []
+        for runtime in active:
+            if not runtime.settings.log:
+                continue
+            runtime.paths.ensure()
+            handler = logging.FileHandler(runtime.paths.log)
+            handler.setFormatter(FILE_FORMATTER)
+            handler.addFilter(_AccountFilter(runtime.name))
+            logger.addHandler(handler)
+            handlers.append(handler)
+
+        # one window, one tray icon, one Tk event pump - one tab per account
+        shell = MinerShell()
+        for runtime in active:
+            shell.add_account(runtime)
+        shell.refresh_title()
+
+        if settings.tray and sys.platform != "darwin":
+            shell.hide()
+        else:
+            shell.show()
+
         loop = asyncio.get_running_loop()
         if sys.platform == "linux":
-            loop.add_signal_handler(signal.SIGINT, lambda *_: client.gui.close())
-            loop.add_signal_handler(signal.SIGTERM, lambda *_: client.gui.close())
+            loop.add_signal_handler(signal.SIGINT, lambda *_: shell.close())
+            loop.add_signal_handler(signal.SIGTERM, lambda *_: shell.close())
+
+        exit_status = 0
+
+        async def run_account(runtime: AccountRuntime) -> None:
+            nonlocal exit_status
+            client = runtime.twitch
+            gui = runtime.gui
+            assert client is not None and gui is not None
+            try:
+                await runtime.run()
+            except CaptchaRequired:
+                exit_status = 1
+                gui.prevent_close()
+                client.print(_("error", "captcha"))
+            except Exception:
+                exit_status = 1
+                gui.prevent_close()
+                client.print("Fatal error encountered:\n")
+                client.print(traceback.format_exc())
+            finally:
+                client.print(_("gui", "status", "exiting"))
+                await client.shutdown()
+            if not gui.close_requested:
+                # user didn't request the closure of this account
+                gui.tray.change_icon("error")
+                client.print(_("status", "terminated"))
+                gui.status.update(_("gui", "status", "terminated"))
+                shell.grab_attention(sound=True)
+            # the window stays open so the error is readable; the account only
+            # finishes once the user closes it
+            await gui.wait_until_closed()
+            # save after wait, the user may still edit settings in the meantime
+            client.save(force=True)
+            gui.stop()
+            gui.close_window()
+
         try:
-            await client.run()
-        except CaptchaRequired:
-            exit_status = 1
-            client.prevent_close()
-            client.print(_("error", "captcha"))
-        except Exception:
-            exit_status = 1
-            client.prevent_close()
-            client.print("Fatal error encountered:\n")
-            client.print(traceback.format_exc())
+            await asyncio.gather(*(run_account(runtime) for runtime in active))
         finally:
             if sys.platform == "linux":
                 loop.remove_signal_handler(signal.SIGINT)
                 loop.remove_signal_handler(signal.SIGTERM)
-            client.print(_("gui", "status", "exiting"))
-            await client.shutdown()
-        if not client.gui.close_requested:
-            # user didn't request the closure
-            client.gui.tray.change_icon("error")
-            client.print(_("status", "terminated"))
-            client.gui.status.update(_("gui", "status", "terminated"))
-            # notify the user about the closure
-            client.gui.grab_attention(sound=True)
-        await client.gui.wait_until_closed()
-        # save the application state
-        # NOTE: we have to do it after wait_until_closed,
-        # because the user can alter some settings between app termination and closing the window
-        client.save(force=True)
-        client.gui.stop()
-        client.gui.close_window()
+            if shell.tray is not None:
+                shell.tray.stop()
+            for handler in handlers:
+                logger.removeHandler(handler)
+                handler.close()
+            for file in locks:
+                file.close()
+
         sys.exit(exit_status)
 
     try:
-        # use lock_file to check if we're not already running
-        success, file = lock_file(LOCK_PATH)
-        if not success:
-            # already running - exit
-            sys.exit(3)
-
         asyncio.run(main())
     finally:
-        file.close()
+        pass
