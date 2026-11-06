@@ -22,8 +22,13 @@ git push -u origin feature/multi-account
 推送到 `master` / `main` / `feature/multi-account` 任一分支，都会触发：
 
 - `validate`：校验 `lang/*.json` 全部合法
-- `windows` / `macos` / `linux-pyinstaller` / `linux-appimage`：四路构建
+- `windows` / `linux-pyinstaller` / `linux-appimage`：三路构建（Windows 1 份、
+  Linux PyInstaller 与 AppImage 各 x86_64 / aarch64 两份）
 - 产物作为 Actions artifact 上传，可在运行页面下载
+
+> macOS 构建已移除。`macos-latest` 长期排队后被取消，导致 `publish_release`
+> 每次都因依赖未满足而 skip，打标签发不出任何 Release。要恢复的话，把
+> `macos` 作业加回 `ci.yml`，并把 `macos` 加进 `publish_release.needs`。
 
 ## 正式发版（自动）
 
@@ -34,7 +39,7 @@ git tag -a v16.0 -m "Multi-account release"
 git push origin v16.0
 ```
 
-触发 `publish_release` 作业，把本次构建的四份产物作为非预发布 Release 发布，
+触发 `publish_release` 作业，把本次构建的三路（共五份）产物作为非预发布 Release 发布，
 标题取 `version.py` 里的版本号。若同名 tag 已有 Release，会原地更新（`allowUpdates`）。
 
 ## 预发布（dev-build）
