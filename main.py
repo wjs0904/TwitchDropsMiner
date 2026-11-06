@@ -28,13 +28,15 @@ if __name__ == "__main__":
     from version import __version__
     from exceptions import CaptchaRequired
     from utils import lock_file, resource_path, set_root_icon
-    from constants import LOGGING_LEVELS, SELF_PATH, FILE_FORMATTER
+    from constants import LOGGING_LEVELS, SELF_PATH
     from accounts import (
         AccountEntry,
         AccountRuntime,
         DEFAULT_ACCOUNT,
-        CURRENT_ACCOUNT,
+        install_log_handler,
         load_registry,
+        load_registry_all,
+        save_registry,
     )
     from shell import MinerShell
 
@@ -53,22 +55,6 @@ if __name__ == "__main__":
     # XWayland/Mutter lockups during heavy Tkinter layout updates.
     if sys.platform.startswith("linux") and "XMODIFIERS" not in os.environ:
         os.environ["XMODIFIERS"] = "@im=none"
-
-    class _AccountFilter(logging.Filter):
-        """
-        Keeps a per-account log file free of other accounts' records.
-
-        Records emitted outside any account task (startup, shell, shutdown) are
-        broadcast, which is why the `not current` case passes.
-        """
-
-        def __init__(self, account: str) -> None:
-            super().__init__()
-            self._account = account
-
-        def filter(self, record: logging.LogRecord) -> bool:
-            current = CURRENT_ACCOUNT.get()
-            return not current or current == self._account
 
     class Parser(argparse.ArgumentParser):
         def __init__(self, *args, **kwargs) -> None:
@@ -212,15 +198,13 @@ if __name__ == "__main__":
         for runtime in active:
             if not runtime.settings.log:
                 continue
-            runtime.paths.ensure()
-            handler = logging.FileHandler(runtime.paths.log)
-            handler.setFormatter(FILE_FORMATTER)
-            handler.addFilter(_AccountFilter(runtime.name))
-            logger.addHandler(handler)
-            handlers.append(handler)
+            handler = install_log_handler(runtime.name, runtime.paths)
+            if handler is not None:
+                handlers.append(handler)
 
         # one window, one tray icon, one Tk event pump - one tab per account
         shell = MinerShell()
+
         for runtime in active:
             shell.add_account(runtime)
         shell.refresh_title()
@@ -236,6 +220,9 @@ if __name__ == "__main__":
             loop.add_signal_handler(signal.SIGTERM, lambda *_: shell.close())
 
         exit_status = 0
+        # Accounts added at runtime append their task here; the wait loop above
+        # picks them up on its next round.
+        tasks: list[asyncio.Task[None]] = []
 
         async def run_account(runtime: AccountRuntime) -> None:
             nonlocal exit_status
@@ -270,8 +257,70 @@ if __name__ == "__main__":
             gui.stop()
             gui.close_window()
 
+        def add_account_at_runtime(raw_name: str) -> str | None:
+            """
+            Build, register and start one account while the program runs.
+
+            Returns an error message for the caller to display, or None on
+            success. Everything the startup path does for an account happens
+            here too, in the same order, so a tab added at runtime is
+            indistinguishable from one created at launch.
+            """
+            try:
+                entry = AccountEntry(raw_name)
+            except ValueError:
+                return _("gui", "accounts", "invalid")
+            if any(rt.name.casefold() == entry.name.casefold() for rt in runtimes):
+                return _("gui", "accounts", "duplicate").format(name=entry.name)
+            runtime = AccountRuntime(entry, args)
+            try:
+                runtime.build()
+            except Exception:
+                logger.exception(f"Could not create account {entry.name!r}")
+                return _("gui", "accounts", "error")
+            success, lock = lock_file(runtime.paths.lock)
+            if not success:
+                lock.close()
+                return _("gui", "accounts", "in_use").format(name=entry.name)
+            handler = None
+            # the new account inherits the log level of the account that started
+            # it: `--log` is process-wide, so mirror the primary account instead
+            if runtime.settings is not None and runtime.settings.log:
+                handler = install_log_handler(entry.name, runtime.paths)
+                if handler is not None:
+                    handlers.append(handler)
+            try:
+                shell.add_account(runtime)
+            except Exception:
+                logger.exception(f"Could not build the tab for account {entry.name!r}")
+                if handler is not None:
+                    logger.removeHandler(handler)
+                    handler.close()
+                lock.close()
+                return _("gui", "accounts", "error")
+            # persist before starting, so a crash still leaves a usable registry
+            registry = load_registry_all()
+            if not any(e.name.casefold() == entry.name.casefold() for e in registry):
+                registry.append(entry)
+                save_registry(registry)
+            runtimes.append(runtime)
+            locks.append(lock)
+            tasks.append(asyncio.create_task(run_account(runtime)))
+            shell.refresh_title()
+            shell.show()
+            return None
+
+        shell.add_account_hook = add_account_at_runtime
+
         try:
-            await asyncio.gather(*(run_account(runtime) for runtime in active))
+            tasks.extend(asyncio.create_task(run_account(runtime)) for runtime in active)
+            # The account registry can grow while the program runs (the "+" tab),
+            # so wait in rounds instead of one `gather` over a fixed list.
+            while True:
+                pending = [task for task in tasks if not task.done()]
+                if not pending:
+                    break
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         finally:
             if sys.platform == "linux":
                 loop.remove_signal_handler(signal.SIGINT)

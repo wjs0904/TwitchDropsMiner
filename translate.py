@@ -91,6 +91,8 @@ class GUIAccounts(TypedDict):
     empty: str
     confirm_remove: str
     last_account: str
+    prompt: str
+    duplicate: str
 
 
 class GUILoginForm(TypedDict):
@@ -342,6 +344,8 @@ default_translation: Translation = {
             "empty": "Enter an account name first.",
             "confirm_remove": "Remove account {name}? Its saved login and settings will be deleted.",
             "last_account": "At least one account has to remain configured.",
+            "prompt": "Name for the new account:",
+            "duplicate": "An account named {name} already exists.",
         },
         "login": {
             "name": "Login Form",

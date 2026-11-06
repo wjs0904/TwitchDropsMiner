@@ -23,7 +23,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from constants import WORKING_DIR, AccountPaths
+from constants import FILE_FORMATTER, WORKING_DIR, AccountPaths
 from translate import _
 from utils import json_load, json_save
 
@@ -75,6 +75,43 @@ def validate_name(name: str) -> str:
     if cleaned.casefold() in _RESERVED_NAMES:
         raise ValueError(f"account name is a reserved device name: {name!r}")
     return cleaned
+
+
+class AccountFilter(logging.Filter):
+    """
+    Keeps a per-account log file free of other accounts' records.
+
+    Records emitted outside any account task (startup, shell, shutdown) are
+    broadcast, which is why the `not current` case passes.
+    """
+
+    def __init__(self, account: str) -> None:
+        super().__init__()
+        self._account = account
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        current = CURRENT_ACCOUNT.get()
+        return not current or current == self._account
+
+
+def install_log_handler(name: str, paths: AccountPaths) -> logging.Handler | None:
+    """
+    Attach this account's own `log.txt`, when the user asked for a log file.
+
+    Shared by the startup path and by accounts added while the program is
+    already running, so a tab created later logs exactly like the first one.
+    """
+    runtime_logger = logging.getLogger("TwitchDrops")
+    paths.ensure()
+    try:
+        handler = logging.FileHandler(paths.log)
+    except OSError:
+        logger.warning(f"Could not open the log file for account {name!r}")
+        return None
+    handler.setFormatter(FILE_FORMATTER)
+    handler.addFilter(AccountFilter(name))
+    runtime_logger.addHandler(handler)
+    return handler
 
 
 class AccountEntry:

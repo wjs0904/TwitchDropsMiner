@@ -17,7 +17,7 @@ import ctypes
 import asyncio
 import logging
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox, simpledialog
 from typing import Any, Callable, NoReturn, TYPE_CHECKING
 
 from constants import WINDOW_TITLE, State
@@ -76,6 +76,15 @@ class MinerShell:
         self._notebook.grid(column=0, row=0, sticky="nsew")
         self._host.rowconfigure(0, weight=1)
         self._host.columnconfigure(0, weight=1)
+        # A trailing "+" tab is the visible entry point for adding an account.
+        # It lives in the tab strip itself, so it can never be covered by tabs
+        # as they grow, and it keeps the tab index equal to the account index.
+        self._add_tab = ttk.Frame(self._notebook)
+        self._notebook.add(self._add_tab, text="+")
+        self._suppress_tab_event = False
+        # Set by main: takes a name, builds and starts that account, and returns
+        # an error message on failure (None means the tab now exists).
+        self.add_account_hook: Callable[[str], str | None] | None = None
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # Windows shutdown handling lives at the window level
@@ -117,7 +126,8 @@ class MinerShell:
     def add_account(self, runtime: Any) -> GUIManager:
         """Create a tab for `runtime` and build its widgets inside it."""
         frame = ttk.Frame(self._notebook)
-        self._notebook.add(frame, text=runtime.display_name)
+        # keep the "+" tab last: account tabs are always 0..len(self.tabs)-1
+        self._notebook.insert(len(self.tabs), frame, text=runtime.display_name)
         runtime.attach(self, frame)
         gui = runtime.gui
         assert gui is not None
@@ -131,14 +141,30 @@ class MinerShell:
     def detach_account(self, gui: GUIManager) -> None:
         """Remove one account's tab; tear the window down when the last one goes."""
         if gui in self.tabs:
+            index = self.tabs.index(gui)
             self.tabs.remove(gui)
+            try:
+                # account tabs occupy 0..len(self.tabs), the "+" tab is last
+                self._notebook.forget(index)
+            except tk.TclError:
+                pass
         if self._active is gui:
             self._active = self.tabs[0] if self.tabs else None
         if not self.tabs:
             self._teardown()
 
     def _on_tab_changed(self, event: Any) -> None:
+        if self._suppress_tab_event:
+            return
         index = self._notebook.index("current")
+        if index >= len(self.tabs):
+            # the trailing "+" tab was selected - ask for a name instead of
+            # showing an empty page, then return to the tab the user came from
+            self._prompt_new_account()
+            return
+        self._activate_tab(index)
+
+    def _activate_tab(self, index: int) -> None:
         if 0 <= index < len(self.tabs):
             gui = self.tabs[index]
             if gui is not self._active:
@@ -149,6 +175,42 @@ class MinerShell:
                     tray.resync()
                 gui.apply_theme(gui._twitch.settings.dark_mode)
             self.root.focus_set()
+
+    def _select_account(self, index: int) -> None:
+        """Select an account tab without re-entering `_on_tab_changed` logic."""
+        if not (0 <= index < len(self.tabs)):
+            return
+        self._suppress_tab_event = True
+        try:
+            self._notebook.select(index)
+        finally:
+            self._suppress_tab_event = False
+
+    def _prompt_new_account(self) -> None:
+        """The "+" tab was clicked: ask for a name and start that account."""
+        # go back to a real account tab first, so cancelling leaves no blank page
+        previous = self.tabs.index(self._active) if self._active in self.tabs else 0
+        self._select_account(previous)
+        if self.add_account_hook is None:
+            return
+        reply = simpledialog.askstring(
+            _("gui", "accounts", "add"),
+            _("gui", "accounts", "prompt"),
+            parent=self.root,
+        )
+        if reply is None:
+            return
+        name = reply.strip()
+        if not name:
+            messagebox.showerror(
+                _("gui", "accounts", "add"),
+                _("gui", "accounts", "empty"),
+                parent=self.root,
+            )
+            return
+        error = self.add_account_hook(name)
+        if error is not None:
+            messagebox.showerror(_("gui", "accounts", "add"), error, parent=self.root)
 
     @property
     def active_gui(self) -> GUIManager | None:
