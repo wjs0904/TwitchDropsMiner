@@ -8,6 +8,9 @@ import ctypes
 import asyncio
 import logging
 import plistlib
+import threading
+import urllib.error
+import urllib.request
 import tkinter as tk
 from pathlib import Path
 from collections import abc
@@ -44,6 +47,7 @@ from accounts import (
     load_registry_all,
     save_registry,
     validate_name,
+    validate_proxy,
 )
 from constants import (
     MAX_INT,
@@ -1662,6 +1666,25 @@ def proxy_validate(entry: PlaceholderEntry, settings: Settings) -> bool:
     return valid
 
 
+def _probe_exit_ip(proxy: str, timeout: float = 8.0) -> str:
+    """
+    Return the public IP this proxy exits from, or "" when it cannot be reached.
+
+    This is a plain blocking call on purpose: it runs on a worker thread from
+    the account manager, where waiting is fine and returning a partial answer
+    would be worse than returning nothing. A failed probe is reported as such
+    rather than being mistaken for "no proxy".
+    """
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    try:
+        with opener.open("https://api.ipify.org", timeout=timeout) as response:
+            return response.read(64).decode("ascii", "replace").strip()
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+
+
 class _SettingsVars(TypedDict):
     tray: IntVar
     proxy: StringVar
@@ -1710,7 +1733,7 @@ class AccountManagerDialog:
         list_frame.grid(column=0, row=1, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         self._list = PaddedListbox(
-            list_frame, height=8, width=34, padding=(1, 0),
+            list_frame, height=8, width=40, padding=(1, 0),
             activestyle="none", selectmode="single",
             highlightthickness=0, exportselection=False,
         )
@@ -1742,16 +1765,45 @@ class AccountManagerDialog:
             column=1, row=0, padx=(4, 0)
         )
 
+        # Per-account exit. This is the whole point of the split: each tab has to
+        # leave through a different IP, so the value lives next to the account
+        # rather than in the settings page of each tab.
+        proxy_frame = ttk.LabelFrame(
+            body, text=_("gui", "accounts", "proxy"), padding=6
+        )
+        proxy_frame.grid(column=0, row=4, sticky="ew", pady=(8, 0))
+        proxy_frame.columnconfigure(0, weight=1)
+        self._new_proxy = StringVar(win, "")
+        self._probe_result: list[tuple[str, str]] | None = None
+        proxy_entry = ttk.Entry(proxy_frame, textvariable=self._new_proxy, width=30)
+        proxy_entry.grid(column=0, row=0, columnspan=2, sticky="ew")
+        proxy_entry.bind("<Return>", lambda _e: self._set_proxy())
+        ttk.Label(
+            proxy_frame,
+            text=_("gui", "accounts", "proxy_hint"),
+            foreground="gray50",
+            wraplength=260,
+        ).grid(column=0, row=1, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Button(
+            proxy_frame, text=_("gui", "accounts", "proxy_save"), command=self._set_proxy
+        ).grid(column=0, row=2, sticky="w")
+        ttk.Button(
+            proxy_frame, text=_("gui", "accounts", "proxy_clear"), command=self._clear_proxy
+        ).grid(column=1, row=2, padx=(4, 0), sticky="w")
+        ttk.Button(
+            proxy_frame, text=_("gui", "accounts", "check_ips"), command=self._check_ips
+        ).grid(column=0, row=3, columnspan=2, sticky="w", pady=(4, 0))
+
         self._status = ttk.Label(body, text="", foreground="red", wraplength=280)
-        self._status.grid(column=0, row=4, sticky="w", pady=(6, 0))
+        self._status.grid(column=0, row=5, sticky="w", pady=(6, 0))
 
         ttk.Label(
             body, text=_("gui", "accounts", "restart_hint"), foreground="goldenrod",
             wraplength=280,
-        ).grid(column=0, row=5, sticky="w", pady=(4, 0))
+        ).grid(column=0, row=6, sticky="w", pady=(4, 0))
 
         ttk.Button(body, text=_("gui", "accounts", "close"), command=self._close).grid(
-            column=0, row=6, sticky="e", pady=(8, 0)
+            column=0, row=7, sticky="e", pady=(8, 0)
         )
 
         self._refresh()
@@ -1767,8 +1819,18 @@ class AccountManagerDialog:
         self._list.delete(0, "end")
         for entry in self._entries:
             mark = "✓" if entry.enabled else "✗"
+            # Only the port is shown: a full URL does not fit the list, and the
+            # host is the same for every account in a split anyway.
+            if entry.proxy:
+                port = URL(entry.proxy).explicit_port
+                exit_note = f":{port}" if port else entry.proxy
+            else:
+                exit_note = _("gui", "accounts", "proxy_free")
             self._list.insert(
-                "end", f" {mark}  {entry.name}" + ("" if entry.enabled else "  (off)")
+                "end",
+                f" {mark}  {entry.name}"
+                + ("" if entry.enabled else "  (off)")
+                + f"   {exit_note}",
             )
         if self._entries:
             idx = min(keep, len(self._entries) - 1)
@@ -1785,6 +1847,8 @@ class AccountManagerDialog:
             self._toggle_btn.configure(
                 text=_("gui", "accounts", "disable" if entry.enabled else "enable")
             )
+            # show this account's exit so it can be edited without guessing
+            self._new_proxy.set(entry.proxy)
 
     def _say(self, message: str) -> None:
         self._status.configure(text=message)
@@ -1848,6 +1912,97 @@ class AccountManagerDialog:
         self._say("")
         self._persist()
         self._refresh()
+
+    def _set_proxy(self) -> None:
+        """Bind the selected account to the proxy typed in the field."""
+        sel = self._list.curselection()
+        if not sel:
+            self._say(_("gui", "accounts", "empty"))
+            return
+        entry = self._entries[sel[0]]
+        raw = self._new_proxy.get().strip()
+        try:
+            entry.proxy = validate_proxy(raw)
+        except ValueError:
+            self._say(_("gui", "accounts", "invalid_proxy"))
+            return
+        # two accounts on the same exit defeats the purpose of the split, and
+        # it is far easier to catch here than by comparing IPs later
+        clash = next(
+            (
+                other
+                for other in self._entries
+                if other is not entry and entry.proxy and other.proxy == entry.proxy
+            ),
+            None,
+        )
+        if clash is not None:
+            self._say(_("gui", "accounts", "proxy_taken").format(name=clash.name))
+            return
+        self._say("")
+        self._persist()
+        self._refresh()
+
+    def _clear_proxy(self) -> None:
+        """Leave this account on the direct connection again."""
+        sel = self._list.curselection()
+        if not sel:
+            self._say(_("gui", "accounts", "empty"))
+            return
+        self._entries[sel[0]].proxy = ""
+        self._new_proxy.set("")
+        self._say("")
+        self._persist()
+        self._refresh()
+
+    def _check_ips(self) -> None:
+        """
+        Ask every bound proxy what its exit IP is.
+
+        Two accounts on the same exit look correct in the list but defeat the
+        whole split, and the only way to know is to ask the proxy. The requests
+        run on a worker thread so the window stays responsive while a dead
+        proxy times out; the result is picked up by a poll on the Tk thread,
+        because touching Tk from the worker is not allowed.
+        """
+        targets = [(e.name, e.proxy) for e in self._entries if e.proxy]
+        if not targets:
+            self._say(_("gui", "accounts", "proxy_free"))
+            return
+        self._say(_("gui", "accounts", "checking"))
+        self._probe_result: list[tuple[str, str]] | None = None
+
+        def worker() -> None:
+            results = [(name, _probe_exit_ip(proxy)) for name, proxy in targets]
+            self._probe_result = results
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._await_probe()
+
+    def _await_probe(self) -> None:
+        """Poll for the worker's result without blocking the event loop."""
+        if self._probe_result is None:
+            self._win.after(120, self._await_probe)
+            return
+        results, self._probe_result = self._probe_result, None
+        self._show_ips(results)
+
+    def _show_ips(self, results: list[tuple[str, str]]) -> None:
+        lines: list[str] = []
+        by_ip: dict[str, list[str]] = {}
+        for name, ip in results:
+            if not ip:
+                lines.append(_("gui", "accounts", "ip_failed").format(name=name))
+                continue
+            lines.append(_("gui", "accounts", "ip_result").format(name=name, ip=ip))
+            by_ip.setdefault(ip, []).append(name)
+        shared = [
+            _("gui", "accounts", "ip_shared").format(names=", ".join(names))
+            for names in by_ip.values()
+            if len(names) > 1
+        ]
+        self._status.configure(foreground="red" if shared else "green")
+        self._say("\n".join(lines + shared))
 
     def _close(self) -> None:
         try:

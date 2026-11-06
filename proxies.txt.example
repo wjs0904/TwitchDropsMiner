@@ -1,0 +1,20 @@
+# Proxy pool for the multi-account build.
+#
+# One proxy per line. Each enabled account is bound to its own entry, and the
+# binding is written into accounts.json, so the exit IP of an account stays the
+# same across restarts - a stable exit is worth more than a rotating one when it
+# comes to automated account checks.
+#
+# Copy this file to `proxies.txt` next to the program and fill in your ports.
+# With Clash / mihomo, give each account its own mixed-port listener, e.g.:
+#
+#   mixed-port: 7897   -> account 1
+#   listeners: [{name: p2, port: 7898, type: mixed}]
+#   listeners: [{name: p3, port: 7899, type: mixed}]
+#
+# Lines starting with # are ignored. Blank lines are ignored.
+# A line without a scheme is treated as http://host:port.
+
+127.0.0.1:7897
+127.0.0.1:7898
+127.0.0.1:7899

@@ -30,3 +30,4 @@ settings.json
 # itself is user data and must never be committed.
 /accounts
 /accounts.json
+/proxies.txt

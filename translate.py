@@ -93,6 +93,23 @@ class GUIAccounts(TypedDict):
     last_account: str
     prompt: str
     duplicate: str
+    no_proxy: str
+    proxy: str
+    proxy_hint: str
+    proxies: str
+    proxy_bound: str
+    proxy_free: str
+    proxy_save: str
+    proxy_clear: str
+    proxy_pool: str
+    proxy_pool_hint: str
+    check_ips: str
+    checking: str
+    ip_result: str
+    ip_failed: str
+    ip_shared: str
+    invalid_proxy: str
+    proxy_taken: str
 
 
 class GUILoginForm(TypedDict):
@@ -346,6 +363,23 @@ default_translation: Translation = {
             "last_account": "At least one account has to remain configured.",
             "prompt": "Name for the new account:",
             "duplicate": "An account named {name} already exists.",
+            "no_proxy": "Account {name} has no proxy of its own and the proxy pool is used up - it will not start, so that it cannot fall back to the bare connection.",
+            "proxy": "Proxy",
+            "proxy_hint": "For this account only, e.g. http://127.0.0.1:7898",
+            "proxies": "Proxies",
+            "proxy_bound": "own proxy",
+            "proxy_free": "no proxy - direct connection",
+            "proxy_save": "Set proxy",
+            "proxy_clear": "Clear proxy",
+            "proxy_pool": "Proxy pool",
+            "proxy_pool_hint": "One proxy per line, in proxies.txt",
+            "check_ips": "Check exit IPs",
+            "checking": "Checking...",
+            "ip_result": "{name}: {ip}",
+            "ip_failed": "{name}: could not reach the proxy",
+            "ip_shared": "Accounts {names} leave through the same IP — the split is not working for them.",
+            "invalid_proxy": "Invalid proxy. Use host:port, or a URL such as http://127.0.0.1:7898.",
+            "proxy_taken": "Account {name} already uses that proxy.",
         },
         "login": {
             "name": "Login Form",

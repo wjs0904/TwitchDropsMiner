@@ -33,9 +33,12 @@ if __name__ == "__main__":
         AccountEntry,
         AccountRuntime,
         DEFAULT_ACCOUNT,
+        apply_proxy_pool,
+        assign_proxies,
         install_log_handler,
-        load_registry,
         load_registry_all,
+        proxy_status,
+        read_proxy_pool_file,
         save_registry,
     )
     from shell import MinerShell
@@ -148,10 +151,17 @@ if __name__ == "__main__":
     async def main() -> None:
         # An absent registry means "plain single-account install": behave exactly
         # like the upstream build, straight out of the working directory.
-        entries = load_registry()
+        entries = load_registry_all()
         if not entries:
             entries = [AccountEntry(DEFAULT_ACCOUNT)]
-        runtimes = [AccountRuntime(entry, args) for entry in entries]
+        # Bind each account to its own exit before anything is built, so the
+        # very first request already leaves through the assigned proxy. A pool
+        # file that exists makes the binding mandatory - see below.
+        pool = read_proxy_pool_file()
+        apply_proxy_pool(entries, pool)
+        runtimes = [
+            AccountRuntime(entry, args) for entry in entries if entry.enabled
+        ]
 
         # Language and log levels are process-wide, so the first account decides.
         primary = runtimes[0]
@@ -178,12 +188,33 @@ if __name__ == "__main__":
         for runtime in runtimes[1:]:
             runtime.build()
 
+        # Per-account log files, filtered by the account context variable. This
+        # has to happen before the accounts are filtered below: an account that
+        # gets refused over its missing proxy is exactly the one whose log the
+        # user will go looking for, so the handler must already be attached.
+        handlers: list[logging.Handler] = []
+        for runtime in runtimes:
+            if not runtime.settings.log:
+                continue
+            handler = install_log_handler(runtime.name, runtime.paths)
+            if handler is not None:
+                handlers.append(handler)
+
         # One lock file per account. Besides keeping two copies of the whole
         # program from fighting over the same files, this also skips an account
         # that is already running in another instance.
         locks = []
         active: list[AccountRuntime] = []
         for runtime in runtimes:
+            # Refuse an account that would leave over the bare connection while
+            # a pool is configured: falling back to the direct route would hand
+            # the real IP to Twitch, which is worse than not mining at all.
+            if pool and not runtime.entry.proxy:
+                message = _("gui", "accounts", "no_proxy").format(
+                    name=runtime.display_name
+                )
+                logger.error(message)
+                continue
             success, file = lock_file(runtime.paths.lock)
             if not success:
                 logger.warning(_("gui", "accounts", "in_use").format(name=runtime.name))
@@ -192,15 +223,8 @@ if __name__ == "__main__":
             active.append(runtime)
         if not active:
             sys.exit(3)
-
-        # per-account log files, filtered by the account context variable
-        handlers: list[logging.Handler] = []
-        for runtime in active:
-            if not runtime.settings.log:
-                continue
-            handler = install_log_handler(runtime.name, runtime.paths)
-            if handler is not None:
-                handlers.append(handler)
+        if pool:
+            logger.info(proxy_status([runtime.entry for runtime in active]))
 
         # one window, one tray icon, one Tk event pump - one tab per account
         shell = MinerShell()
@@ -272,6 +296,22 @@ if __name__ == "__main__":
                 return _("gui", "accounts", "invalid")
             if any(rt.name.casefold() == entry.name.casefold() for rt in runtimes):
                 return _("gui", "accounts", "duplicate").format(name=entry.name)
+            # A new account joins the same split as the running ones: it takes a
+            # free proxy before it is built, and is refused when the pool is
+            # exhausted rather than leaving over the bare connection.
+            if pool:
+                registry = load_registry_all()
+                registry.append(entry)
+                assign_proxies(registry, pool)
+                entry = next(
+                    e for e in registry
+                    if e.name.casefold() == entry.name.casefold()
+                )
+                save_registry(registry)
+                if not entry.proxy:
+                    return _("gui", "accounts", "no_proxy").format(
+                        name=entry.name
+                    )
             runtime = AccountRuntime(entry, args)
             try:
                 runtime.build()

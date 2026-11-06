@@ -98,6 +98,37 @@ class _AuthState:
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def _browser_proxy_args(self) -> list[str]:
+        """
+        Chromium flags that put the login browser behind this account's proxy.
+
+        aiohttp takes the proxy per request, but a browser needs it at launch,
+        so the value from the account's settings is translated into the flag
+        pair Chromium understands. Nothing is added when no proxy is set, which
+        keeps the default single-account behaviour untouched.
+        """
+        proxy = self._twitch.settings.proxy
+        if not proxy or not proxy.host:
+            return []
+        scheme = proxy.scheme or "http"
+        if scheme.startswith("socks"):
+            # Chromium only speaks SOCKS5 and ignores the leftover socks4 case,
+            # so anything SOCKS-ish is handed over as SOCKS5.
+            host = f"socks5://{proxy.host}:{proxy.port}"
+        else:
+            host = f"http://{proxy.host}:{proxy.port}"
+        args = [f"--proxy-server={host}"]
+        if proxy.user:
+            # Chromium has no way to put credentials in --proxy-server, and the
+            # extension route needs a real extension, so an authenticated proxy
+            # is reported instead of silently connecting without credentials.
+            logger.warning(
+                "The login browser cannot use a proxy that requires credentials; "
+                "it will open without them. Log in through a client that already "
+                "has a session, or use a proxy that authenticates by IP."
+            )
+        return args
+
     def invalidate(self, *, delete_cookies: bool = False) -> None:
         self._delattrs("access_token", "user_id")
         self._logged_in.clear()
@@ -140,7 +171,12 @@ class _AuthState:
             # login_data = await login_form.ask_login()
             browser: zendriver.Browser | None = None
             try:
-                browser = await zendriver.start()
+                # The login page has to leave through the same exit as the
+                # mining traffic. Logging in from one IP and then mining from
+                # another is exactly the pattern that account checks look for.
+                browser = await zendriver.start(
+                    browser_args=self._browser_proxy_args()
+                )
                 await browser.get(
                     f"https://www.twitch.tv/login?client_id={client_info.CLIENT_ID}&"
                     f"redirect_params=client_id%3D{client_info.CLIENT_ID}%26"

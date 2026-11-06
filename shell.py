@@ -136,6 +136,11 @@ class MinerShell:
         self.tabs.append(gui)
         if self._active is None and len(self.tabs) == 1:
             self._active = gui
+        # Inserting before the "+" tab shifts its index but leaves it selected,
+        # so a fresh window would show the empty "+" frame instead of the new
+        # account. Select the account tab; the event it fires activates it.
+        if len(self.tabs) == 1:
+            self._notebook.select(0)
         return gui
 
     def detach_account(self, gui: GUIManager) -> None:

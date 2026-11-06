@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from yarl import URL
+
 from constants import FILE_FORMATTER, WORKING_DIR, AccountPaths
 from translate import _
 from utils import json_load, json_save
@@ -42,6 +44,11 @@ CURRENT_ACCOUNT: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 REGISTRY_PATH: Path = Path(WORKING_DIR, "accounts.json")
+
+# Optional list of exits, one per line. Present means "every enabled account
+# must get its own entry from here"; absent means "the per-account settings
+# file decides", which is what a plain single-account install does.
+PROXY_POOL_PATH: Path = Path(WORKING_DIR, "proxies.txt")
 
 # Marker value stored in the registry for the account that lives in the working dir.
 DEFAULT_ACCOUNT = "default"
@@ -104,7 +111,9 @@ def install_log_handler(name: str, paths: AccountPaths) -> logging.Handler | Non
     runtime_logger = logging.getLogger("TwitchDrops")
     paths.ensure()
     try:
-        handler = logging.FileHandler(paths.log)
+        # Without an explicit encoding the handler uses the locale default,
+        # which mangles every non-ASCII message on a Chinese Windows install.
+        handler = logging.FileHandler(paths.log, encoding="utf-8")
     except OSError:
         logger.warning(f"Could not open the log file for account {name!r}")
         return None
@@ -114,25 +123,73 @@ def install_log_handler(name: str, paths: AccountPaths) -> logging.Handler | Non
     return handler
 
 
+_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks4", "socks5h", "socks4a"})
+# A host is either a dotted IPv4 literal or a plain hostname. Anything with a
+# space, a slash, or a stray comma is a pasted comment, not a proxy, and must be
+# rejected instead of being turned into a URL that fails much later.
+_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$|^\[[0-9A-Fa-f:]+\]$")
+
+
+def validate_proxy(raw: str) -> str:
+    r"""
+    Return a normalised proxy URL, or raise ValueError.
+
+    Only the parts we can actually check are enforced: a known scheme, a
+    plausible host and an explicit port. Credentials are allowed and passed
+    through unchanged, since a per-account authenticated proxy is the point of
+    this field. An empty string means "no proxy for this account".
+    """
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    if "://" not in cleaned:
+        # bare host:port is what people paste from a proxy list
+        cleaned = f"http://{cleaned}"
+    parsed = URL(cleaned)
+    if parsed.scheme not in _PROXY_SCHEMES:
+        raise ValueError(f"unsupported proxy scheme: {parsed.scheme!r}")
+    host = parsed.host or ""
+    if not host or not _PROXY_HOST_RE.match(host):
+        raise ValueError(f"proxy host looks wrong: {host!r}")
+    # `port` falls back to the scheme default, so a line without a port would
+    # silently become :80 - which is not what anyone meant to configure.
+    if parsed.explicit_port is None:
+        raise ValueError(f"proxy needs an explicit port: {raw!r}")
+    if not (0 < parsed.explicit_port < 65536):
+        raise ValueError(f"proxy port out of range: {parsed.explicit_port}")
+    return cleaned
+
+
 class AccountEntry:
     """Persisted description of one account."""
 
-    __slots__ = ("name", "enabled")
+    __slots__ = ("name", "enabled", "proxy")
 
-    def __init__(self, name: str, *, enabled: bool = True):
+    def __init__(self, name: str, *, enabled: bool = True, proxy: str = ""):
         self.name = validate_name(name)
         self.enabled = enabled
+        # Empty means "inherit whatever the account's own settings file says",
+        # which keeps accounts.json optional for people who set the proxy in
+        # the settings page instead.
+        self.proxy = validate_proxy(proxy)
 
     def to_json(self) -> dict[str, Any]:
-        return {"name": self.name, "enabled": self.enabled}
+        data: dict[str, Any] = {"name": self.name, "enabled": self.enabled}
+        if self.proxy:
+            data["proxy"] = self.proxy
+        return data
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> AccountEntry:
         name = validate_name(str(data.get("name", "")))
-        return cls(name, enabled=bool(data.get("enabled", True)))
+        return cls(
+            name,
+            enabled=bool(data.get("enabled", True)),
+            proxy=str(data.get("proxy", "") or ""),
+        )
 
     def __repr__(self) -> str:
-        return f"AccountEntry({self.name!r}, enabled={self.enabled})"
+        return f"AccountEntry({self.name!r}, enabled={self.enabled}, proxy={self.proxy!r})"
 
 
 def load_registry() -> list[AccountEntry]:
@@ -185,6 +242,107 @@ def paths_for(entry: AccountEntry) -> AccountPaths:
     return AccountPaths.for_account(entry.name, WORKING_DIR)
 
 
+def assign_proxies(
+    entries: list[AccountEntry], pool: list[str]
+) -> list[AccountEntry]:
+    """
+    Give every enabled account a distinct proxy from `pool`.
+
+    Accounts that already carry a proxy keep it - a re-run must not silently
+    move an account onto a different exit IP, because a stable exit is worth
+    more than a fresh one when it comes to avoiding automated checks.
+
+    Accounts without a proxy are matched against the ports that are still free,
+    in registry order. When the pool runs out the remaining accounts are left
+    without a proxy, and `missing_proxies()` reports them so the caller can
+    refuse to start them instead of letting them go out over the bare
+    connection.
+    """
+    used = {entry.proxy for entry in entries if entry.proxy}
+    free = [proxy for proxy in pool if proxy not in used]
+    for entry in entries:
+        if not entry.enabled or entry.proxy:
+            continue
+        if not free:
+            break
+        entry.proxy = free.pop(0)
+    return entries
+
+
+def missing_proxies(entries: list[AccountEntry]) -> list[AccountEntry]:
+    """Enabled accounts that would still leave over the bare connection."""
+    return [entry for entry in entries if entry.enabled and not entry.proxy]
+
+
+def read_proxy_pool_file(path: Path | None = None) -> list[str]:
+    """
+    Load the proxy pool from disk, or return an empty list when it is absent.
+
+    An empty list is meaningful: the caller treats it as "no pool configured"
+    and leaves each account's proxy to its own settings file.
+    """
+    target = PROXY_POOL_PATH if path is None else path
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning(f"Could not read the proxy pool at {target}")
+        return []
+    return read_proxy_pool(raw)
+
+
+def apply_proxy_pool(
+    entries: list[AccountEntry], pool: list[str]
+) -> list[AccountEntry]:
+    """
+    Bind each enabled account to its own proxy from `pool`, then persist.
+
+    Called once at startup and again whenever an account is added, so a new
+    account never goes out over the bare connection while the pool still has a
+    free entry.
+    """
+    if pool:
+        assign_proxies(entries, pool)
+        save_registry(entries)
+    return entries
+
+
+def proxy_status(entries: list[AccountEntry]) -> str:
+    """One-line summary for the log and the settings page."""
+    enabled = [entry for entry in entries if entry.enabled]
+    if not enabled:
+        return "no enabled accounts"
+    bound = sum(1 for entry in enabled if entry.proxy)
+    return f"{bound}/{len(enabled)} enabled accounts have their own proxy"
+
+
+def read_proxy_pool(raw: str) -> list[str]:
+    """
+    Parse a proxy list pasted as text.
+
+    One proxy per line, `#` starts a comment, blank lines are skipped, and a
+    bare `host:port` gets an `http://` scheme. Duplicates are collapsed so the
+    same exit is never handed to two accounts.
+    """
+    pool: list[str] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            proxy = validate_proxy(line)
+        except ValueError:
+            logger.warning(f"Skipping invalid proxy line: {line!r}")
+            continue
+        if proxy in seen:
+            continue
+        seen.add(proxy)
+        pool.append(proxy)
+    return pool
+
+
 class AccountRuntime:
     """
     Owns one account's settings, Twitch client and GUI manager.
@@ -229,6 +387,11 @@ class AccountRuntime:
 
         self.paths.ensure()
         self.settings = Settings(self.args, self.paths)
+        # The registry wins over the per-account settings file: that is the only
+        # way to change an account's exit point without opening its settings
+        # page, and it keeps the whole split visible in one place.
+        if self.entry.proxy:
+            self.settings.proxy = URL(self.entry.proxy)
         self.twitch = Twitch(self.settings, self.paths)
 
     def attach(self, shell: Any, tab: Any) -> None:

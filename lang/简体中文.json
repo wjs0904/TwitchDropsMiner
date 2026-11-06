@@ -191,7 +191,24 @@
       "confirm_remove": "确定要删除账户 {name} 吗？该账户已保存的登录信息和设置会一并删除。",
       "last_account": "至少需要保留一个已配置的账户。",
       "prompt": "新账户名称：",
-      "duplicate": "账户 {name} 已存在。"
+      "duplicate": "账户 {name} 已存在。",
+      "no_proxy": "账户 {name} 没有独立代理，且代理池已分配完 —— 该账户不会启动，以免回退到直连暴露真实 IP。",
+      "proxy": "代理",
+      "proxy_hint": "仅对该账户生效，例如 http://127.0.0.1:7898",
+      "proxies": "代理分配",
+      "proxy_bound": "独立代理",
+      "proxy_free": "无代理 —— 直连",
+      "proxy_save": "设置代理",
+      "proxy_clear": "清除代理",
+      "proxy_pool": "代理池",
+      "proxy_pool_hint": "每行一个，写在 proxies.txt 里",
+      "check_ips": "检测出口 IP",
+      "checking": "正在检测……",
+      "ip_result": "{name}：{ip}",
+      "ip_failed": "{name}：无法连接到该代理",
+      "ip_shared": "账户 {names} 的出口 IP 相同 —— 这些账户的分流没有生效。",
+      "invalid_proxy": "代理格式无效。请填 host:port，或 http://127.0.0.1:7898 这样的地址。",
+      "proxy_taken": "账户 {name} 已经在使用这个代理了。"
     }
   }
 }
