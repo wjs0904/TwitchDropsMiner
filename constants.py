@@ -100,13 +100,66 @@ SCRIPTS_PATH = Path(VENV_PATH, SYS_SCRIPTS)
 # NOTE: These don't have to be available to the end-user, so the path points to the internal dir
 LANG_PATH = _resource_path("lang")
 # Other Paths
-LOG_PATH = Path(WORKING_DIR, "log.txt")
-DUMP_PATH = Path(WORKING_DIR, "dump.dat")
-LOCK_PATH = Path(WORKING_DIR, "lock.file")
-CACHE_PATH = Path(WORKING_DIR, "cache")
-CACHE_DB = Path(CACHE_PATH, "mapping.json")
-COOKIES_PATH = Path(WORKING_DIR, "cookies.jar")
-SETTINGS_PATH = Path(WORKING_DIR, "settings.json")
+class AccountPaths:
+    """
+    Filesystem layout of a single account.
+
+    These used to be plain module globals, which is fine for one account and
+    broken for several: two concurrently running clients would load and save the
+    same cookies.jar / settings.json / cache and overwrite each other. Every path
+    is therefore an instance attribute now, and is carried by the objects that
+    need it (Settings, Twitch, ImageCache).
+
+    The "default" account deliberately keeps the original flat layout so that an
+    existing single-account install keeps working without any migration.
+    """
+
+    __slots__ = (
+        "name",
+        "root",
+        "log",
+        "dump",
+        "lock",
+        "cache",
+        "cache_db",
+        "cookies",
+        "settings",
+    )
+
+    def __init__(self, name: str, root: Path):
+        self.name: str = name
+        self.root: Path = Path(root)
+        self.log: Path = Path(root, "log.txt")
+        self.dump: Path = Path(root, "dump.dat")
+        self.lock: Path = Path(root, "lock.file")
+        self.cache: Path = Path(root, "cache")
+        self.cache_db: Path = Path(self.cache, "mapping.json")
+        self.cookies: Path = Path(root, "cookies.jar")
+        self.settings: Path = Path(root, "settings.json")
+
+    @classmethod
+    def for_account(cls, name: str, base: Path | None = None) -> AccountPaths:
+        base = Path(base) if base is not None else WORKING_DIR
+        if not name or name == "default":
+            return cls("default", base)
+        return cls(name, base.joinpath("accounts", name))
+
+    def ensure(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def __repr__(self) -> str:
+        return f"AccountPaths({self.name!r}, root={str(self.root)!r})"
+
+
+DEFAULT_PATHS = AccountPaths("default", WORKING_DIR)
+
+LOG_PATH = DEFAULT_PATHS.log
+DUMP_PATH = DEFAULT_PATHS.dump
+LOCK_PATH = DEFAULT_PATHS.lock
+CACHE_PATH = DEFAULT_PATHS.cache
+CACHE_DB = DEFAULT_PATHS.cache_db
+COOKIES_PATH = DEFAULT_PATHS.cookies
+SETTINGS_PATH = DEFAULT_PATHS.settings
 # Typing
 JsonType = Dict[str, Any]
 URLType = NewType("URLType", str)

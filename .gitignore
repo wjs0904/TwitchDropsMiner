@@ -26,3 +26,7 @@ settings.json
 /*.AppImage.zsync
 .DS_Store
 *.app
+# Multi-account files: per-account state lives under accounts/, the registry
+# itself is user data and must never be committed.
+/accounts
+/accounts.json

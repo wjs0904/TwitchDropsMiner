@@ -8,7 +8,7 @@ import json
 from typing import Dict, TypedDict, NewType, TYPE_CHECKING
 
 from utils import json_load, json_save
-from constants import URLType, CACHE_PATH, CACHE_DB
+from constants import URLType
 
 from PIL import Image as Image_module
 from PIL.ImageTk import PhotoImage
@@ -39,10 +39,13 @@ class ImageCache:
     def __init__(self, manager: GUIManager) -> None:
         self._root = manager._root
         self._twitch = manager._twitch
+        # per-account cache location; two accounts must never share image files
+        self._cache_path = self._twitch.paths.cache
+        self._cache_db = self._twitch.paths.cache_db
         cleanup: bool = False
-        CACHE_PATH.mkdir(parents=True, exist_ok=True)
+        self._cache_path.mkdir(parents=True, exist_ok=True)
         try:
-            self._hashes: Hashes = json_load(CACHE_DB, default_database, merge=False)
+            self._hashes: Hashes = json_load(self._cache_db, default_database, merge=False)
         except json.JSONDecodeError:
             # if we can't load the mapping file, delete all existing files,
             # then reinitialize the image cache anew
@@ -67,19 +70,19 @@ class ImageCache:
         for img_hash, count in hash_counts.items():
             if count == 0:
                 # hashes come with an extension already
-                CACHE_PATH.joinpath(img_hash).unlink(missing_ok=True)
+                self._cache_path.joinpath(img_hash).unlink(missing_ok=True)
                 # NOTE: The hashes are deleted from self._hashes above
         if cleanup:
             # This cleanups the cache folder from unused PNG files
             orphans = [
-                file.name for file in CACHE_PATH.glob("*.png") if file.name not in hash_counts
+                file.name for file in self._cache_path.glob("*.png") if file.name not in hash_counts
             ]
             for filename in orphans:
-                CACHE_PATH.joinpath(filename).unlink(missing_ok=True)
+                self._cache_path.joinpath(filename).unlink(missing_ok=True)
 
     def save(self, *, force: bool = False) -> None:
         if self._altered or force:
-            json_save(CACHE_DB, self._hashes, sort=True)
+            json_save(self._cache_db, self._hashes, sort=True)
 
     def _new_expires(self) -> datetime:
         return datetime.now(timezone.utc) + self.LIFETIME
@@ -102,7 +105,7 @@ class ImageCache:
                     image = self._images[img_hash]
                 else:
                     try:
-                        loaded = Image_module.open(CACHE_PATH / img_hash)
+                        loaded = Image_module.open(self._cache_path / img_hash)
                         loaded.load()  # force full decode so broken data is caught here
                         self._images[img_hash] = image = loaded
                     except (FileNotFoundError, Image_module.UnidentifiedImageError, OSError):
@@ -119,7 +122,7 @@ class ImageCache:
                     image = Image_module.new("RGB", (10, 10), (255, 255, 255))
                 img_hash = self._hash(image)
                 self._images[img_hash] = image
-                image.save(CACHE_PATH / img_hash)
+                image.save(self._cache_path / img_hash)
                 self._hashes[url] = {
                     "hash": img_hash,
                     "expires": self._new_expires()

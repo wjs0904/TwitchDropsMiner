@@ -5,7 +5,7 @@ from typing import Any, TypedDict, TYPE_CHECKING
 from yarl import URL
 
 from utils import json_load, json_save
-from constants import SETTINGS_PATH, DEFAULT_LANG, PriorityMode
+from constants import AccountPaths, DEFAULT_PATHS, DEFAULT_LANG, PriorityMode
 
 if TYPE_CHECKING:
     from main import ParsedArgs
@@ -32,7 +32,7 @@ default_settings: SettingsFile = {
     "dark_mode": False,
     "autostart_tray": False,
     "connection_quality": 1,
-    "language": DEFAULT_LANG,
+    "language": "简体中文",
     "tray_notifications": True,
     "enable_badges_emotes": False,
     "available_drops_check": False,
@@ -62,12 +62,17 @@ class Settings:
     available_drops_check: bool
     priority_mode: PriorityMode
 
-    PASSTHROUGH = ("_settings", "_args", "_altered")
+    PASSTHROUGH = ("_settings", "_args", "_altered", "_paths")
 
-    def __init__(self, args: ParsedArgs):
-        self._settings: SettingsFile = json_load(SETTINGS_PATH, default_settings)
+    def __init__(self, args: ParsedArgs, paths: AccountPaths | None = None):
+        self._paths: AccountPaths = paths if paths is not None else DEFAULT_PATHS
+        self._settings: SettingsFile = json_load(self._paths.settings, default_settings)
         self._args: ParsedArgs = args
         self._altered: bool = False
+
+    @property
+    def paths(self) -> AccountPaths:
+        return self._paths
 
     # default logic of reading settings is to check args first, then the settings file
     def __getattr__(self, name: str, /) -> Any:
@@ -98,4 +103,5 @@ class Settings:
 
     def save(self, *, force: bool = False) -> None:
         if self._altered or force:
-            json_save(SETTINGS_PATH, self._settings, sort=True)
+            self._paths.ensure()
+            json_save(self._paths.settings, self._settings, sort=True)
