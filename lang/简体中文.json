@@ -28,7 +28,8 @@
   "error": {
     "captcha": "由于验证码验证失败，您的登录请求已被Twitch拒绝，请在12小时后重试。",
     "site_down": "无法连接到Twitch，将在{seconds}秒后重试...",
-    "no_connection": "无法连接到Twitch，将在{seconds}秒后重试，请确保您已经登录到当前网络。若您的网络无法直连Twitch，请在教程指导下开启VPN及添加代理。({url})"
+    "no_connection": "无法连接到Twitch，将在{seconds}秒后重试，请确保您已经登录到当前网络。若您的网络无法直连Twitch，请在教程指导下开启VPN及添加代理。({url})",
+    "proxy_down": "该账户的代理没有响应，{seconds} 秒后重试……（{proxy}）"
   },
   "gui": {
     "output": "运行日志",

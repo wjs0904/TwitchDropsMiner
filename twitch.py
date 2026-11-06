@@ -1419,9 +1419,19 @@ class Twitch:
                 # connection problems, retry
                 if backoff.steps > 1:
                     # just so that quick retries that sometimes happen, aren't shown
-                    self.print(
-                        _("error", "no_connection").format(seconds=round(delay), url=str(url))
-                    )
+                    if kwargs.get("proxy") is not None:
+                        # A dead proxy and a dead uplink look identical from here,
+                        # and the generic message sends people off checking their
+                        # network. Name the proxy so the failing hop is obvious.
+                        self.print(
+                            _("error", "proxy_down").format(
+                                seconds=round(delay), proxy=kwargs["proxy"]
+                            )
+                        )
+                    else:
+                        self.print(
+                            _("error", "no_connection").format(seconds=round(delay), url=str(url))
+                        )
             finally:
                 if response is not None:
                     response.release()

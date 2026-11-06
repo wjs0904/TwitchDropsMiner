@@ -43,6 +43,7 @@ class LoginMessages(TypedDict):
 class ErrorMessages(TypedDict):
     captcha: str
     no_connection: str
+    proxy_down: str
     site_down: str
 
 
@@ -316,6 +317,10 @@ default_translation: Translation = {
         "captcha": "Your login attempt was denied by CAPTCHA.\nPlease try again in 12+ hours.",
         "site_down": "Twitch is down, retrying in {seconds} seconds...",
         "no_connection": "Cannot connect to Twitch, retrying in {seconds} seconds... ({url})",
+        "proxy_down": (
+            "The proxy for this account is not answering, retrying in {seconds} seconds... "
+            "({proxy})"
+        ),
     },
     "gui": {
         "output": "Output",
