@@ -705,12 +705,15 @@ class Twitch:
         Higher numbers -> lower priority.
         MAX_INT (a really big number) signifies the lowest possible priority.
         """
-        if (
-            (game := channel.game) is None  # None when OFFLINE or no game set
-            or game not in self.wanted_games  # we don't care about the played game
-        ):
+        if (game := channel.game) is None:  # None when OFFLINE or no game set
             return MAX_INT
-        return self.wanted_games.index(game)
+        try:
+            # one lookup instead of membership-test-then-scan; the list is short
+            # enough that a dict would be overhead, but the double pass is free
+            # to remove
+            return self.wanted_games.index(game)
+        except ValueError:  # we don't care about the played game
+            return MAX_INT
 
     @staticmethod
     def _viewers_key(channel: Channel) -> int:
@@ -935,7 +938,15 @@ class Twitch:
                             "Channel", "StreamUpdate", channel_id, self.process_stream_update
                         )
                     )
-                self.websocket.add_topics(to_add_topics)
+                dropped = self.websocket.add_topics(to_add_topics)
+                if dropped:
+                    # the list is ordered by priority, so the tail is what fell
+                    # off; those channels will not report state and simply stay
+                    # idle instead of taking the whole run loop down with them
+                    logger.warning(
+                        f"{len(dropped)} channel topic(s) could not be subscribed - "
+                        "the lowest-priority channels will stay idle"
+                    )
                 # relink watching channel after cleanup,
                 # or stop watching it if it no longer qualifies
                 # NOTE: this replaces 'self.watching_channel's internal value with the new object

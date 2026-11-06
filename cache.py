@@ -35,6 +35,12 @@ default_database: Hashes = {}
 
 class ImageCache:
     LIFETIME = timedelta(days=7)
+    # In-memory ceilings. The disk side expires entries after LIFETIME, but the
+    # decoded images and the Tk photos lived until the process exited, so a long
+    # session - times the number of accounts - grew without bound. Photos are
+    # the expensive half: each one is a Tk image object, not just pixel data.
+    MAX_IMAGES = 300
+    MAX_PHOTOS = 400
 
     def __init__(self, manager: GUIManager) -> None:
         self._root = manager._root
@@ -46,11 +52,13 @@ class ImageCache:
         self._cache_path.mkdir(parents=True, exist_ok=True)
         try:
             self._hashes: Hashes = json_load(self._cache_db, default_database, merge=False)
-        except json.JSONDecodeError:
-            # if we can't load the mapping file, delete all existing files,
-            # then reinitialize the image cache anew
+        except (json.JSONDecodeError, OSError):
+            # a damaged mapping file is the expected case, but a full disk or a
+            # permissions problem surfaces here too - both mean the cache cannot
+            # be trusted, so start it over either way instead of crashing
             cleanup = True
             self._hashes = default_database.copy()
+        # insertion-ordered on purpose: used as LRU stores below
         self._images: dict[ImageHash, Image] = {}
         self._photos: dict[tuple[ImageHash, ImageSize], PhotoImage] = {}
         self._lock = asyncio.Lock()
@@ -80,6 +88,21 @@ class ImageCache:
             for filename in orphans:
                 self._cache_path.joinpath(filename).unlink(missing_ok=True)
 
+    def _trim(self) -> None:
+        # Evict least-recently-used entries. dict preserves insertion order and
+        # every hit re-inserts its key, so the first key is the coldest one.
+        while len(self._photos) > self.MAX_PHOTOS:
+            del self._photos[next(iter(self._photos))]
+        while len(self._images) > self.MAX_IMAGES:
+            del self._images[next(iter(self._images))]
+
+    def clear_photos(self, *, keep: int = 0) -> None:
+        # Called when a drop ends: the Tk images for it will not be drawn again,
+        # and holding them across many drops is what made the footprint climb.
+        # Keeping a few avoids a full reload if the same drop comes back.
+        while len(self._photos) > keep:
+            del self._photos[next(iter(self._photos))]
+
     def save(self, *, force: bool = False) -> None:
         if self._altered or force:
             json_save(self._cache_db, self._hashes, sort=True)
@@ -102,7 +125,9 @@ class ImageCache:
                 img_hash = self._hashes[url]["hash"]
                 self._hashes[url]["expires"] = self._new_expires()
                 if img_hash in self._images:
-                    image = self._images[img_hash]
+                    # refresh LRU position
+                    image = self._images.pop(img_hash)
+                    self._images[img_hash] = image
                 else:
                     try:
                         loaded = Image_module.open(self._cache_path / img_hash)
@@ -121,6 +146,7 @@ class ImageCache:
                     # use a blank white image as a fallback
                     image = Image_module.new("RGB", (10, 10), (255, 255, 255))
                 img_hash = self._hash(image)
+                self._images.pop(img_hash, None)
                 self._images[img_hash] = image
                 image.save(self._cache_path / img_hash)
                 self._hashes[url] = {
@@ -141,5 +167,8 @@ class ImageCache:
             except OSError:
                 # broken image data surfaced during resize; fall back to blank placeholder
                 image = Image_module.new("RGB", size, (255, 255, 255))
-        self._photos[photo_key] = photo = PhotoImage(master=self._root, image=image)
+        photo = PhotoImage(master=self._root, image=image)
+        self._photos.pop(photo_key, None)
+        self._photos[photo_key] = photo
+        self._trim()
         return photo

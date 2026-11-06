@@ -830,6 +830,12 @@ class CampaignProgress:
 
 
 class ConsoleOutput:
+    # The widget is append-only, so a long session grows without bound: measured
+    # at ~0.29 KB per line, 100k lines costs ~29 MB of Tcl storage and Tcl does
+    # not hand it back when lines are deleted. Capping keeps a multi-day run flat
+    # instead of slowly eating the machine.
+    MAX_LINES = 5000
+
     def __init__(self, manager: GUIManager, master: ttk.Widget):
         frame = ttk.LabelFrame(master, text=_("gui", "output"), padding=(4, 0, 4, 4))
         frame.grid(column=0, row=3, columnspan=3, sticky="nsew", padx=2)
@@ -859,10 +865,16 @@ class ConsoleOutput:
         stamp = datetime.now().strftime("%X")
         if '\n' in message:
             message = message.replace('\n', f"\n{stamp}: ")
-        self._text.config(state="normal")
-        self._text.insert("end", f"{stamp}: {message}\n")
-        self._text.see("end")  # scroll to the newly added line
-        self._text.config(state="disabled")
+        text = self._text
+        text.config(state="normal")
+        text.insert("end", f"{stamp}: {message}\n")
+        # Trim from the front once over budget. The index has to be a plain line
+        # number - "end-N.0" is rejected as a bad text index.
+        lines = int(text.index("end-1c").split('.')[0]) - 1
+        if lines > self.MAX_LINES:
+            text.delete("1.0", f"{lines - self.MAX_LINES + 1}.0")
+        text.see("end")  # scroll to the newly added line
+        text.config(state="disabled")
 
     def configure_theme(self, *, bg: str, fg: str, sel_bg: str, sel_fg: str):
         # Apply colors to the Tk Text widget used for console output
@@ -2210,7 +2222,8 @@ class SettingsPanel:
             exportselection=False,
         )
         self._priority_list.grid(column=0, row=1, rowspan=5, sticky="nsew")
-        self._priority_list.insert("end", *self._settings.priority)
+        if self._settings.priority:
+            self._priority_list.insert("end", *self._settings.priority)
         weight_scale: int = 5
         ttk.Button(  # Move to top
             priority_frame,
@@ -2273,7 +2286,8 @@ class SettingsPanel:
         self._exclude_list.grid(column=0, row=1, columnspan=2, sticky="nsew")
         exclude_frame.rowconfigure(1, weight=1)
         # insert them alphabetically
-        self._exclude_list.insert("end", *sorted(self._settings.exclude))
+        if self._settings.exclude:
+            self._exclude_list.insert("end", *sorted(self._settings.exclude))
         ttk.Button(
             exclude_frame, text="❌", command=self.exclude_delete, width=3, style="Large.TButton"
         ).grid(column=0, row=2, columnspan=2, sticky="nsew")
@@ -2966,6 +2980,8 @@ class GUIManager:
     def clear_drop(self):
         self.progress.display(None)
         self.tray.update_title(None)
+        # the finished drop will not be drawn again; release its Tk images
+        self._cache.clear_photos()
 
     def print(self, message: str):
         # print to our custom output

@@ -10,7 +10,7 @@ from typing import Any, Literal, TYPE_CHECKING
 import aiohttp
 
 from translate import _
-from exceptions import MinerException, WebsocketClosed
+from exceptions import WebsocketClosed
 from constants import PING_INTERVAL, PING_TIMEOUT, MAX_WEBSOCKETS, WS_TOPICS_LIMIT
 from utils import (
     CHARS_ASCII,
@@ -354,16 +354,16 @@ class WebsocketPool:
         self._running.clear()
         await asyncio.gather(*(ws.stop(remove=clear_topics) for ws in self.websockets))
 
-    def add_topics(self, topics: abc.Iterable[WebsocketTopic]):
+    def add_topics(self, topics: abc.Iterable[WebsocketTopic]) -> list[WebsocketTopic]:
         # ensure no topics end up duplicated
         topics_set = set(topics)
         if not topics_set:
             # nothing to add
-            return
+            return []
         topics_set.difference_update(*(ws.topics.values() for ws in self.websockets))
         if not topics_set:
             # none left to add
-            return
+            return []
         for ws_idx in range(MAX_WEBSOCKETS):
             if ws_idx < len(self.websockets):
                 # just read it back
@@ -378,9 +378,17 @@ class WebsocketPool:
             ws.add_topics(topics_set)
             # see if there's any leftover topics for the next websocket connection
             if not topics_set:
-                return
-        # if we're here, there were leftover topics after filling up all websockets
-        raise MinerException("Maximum topics limit has been reached")
+                return []
+        # Every websocket is full and topics are still left over. Raising here
+        # used to abort the whole run loop, which is a harsh outcome for what is
+        # really a capacity question: the caller asked for more channels than the
+        # endpoint can carry (MAX_CHANNELS already trims to that, so overflow
+        # means the limits in constants.py disagree with what Twitch grants).
+        # Hand the leftovers back and let the caller decide.
+        logger.warning(
+            f"Dropping {len(topics_set)} topic(s): all {MAX_WEBSOCKETS} websockets are full"
+        )
+        return list(topics_set)
 
     def remove_topics(self, topics: abc.Iterable[str]):
         topics_set = set(topics)
