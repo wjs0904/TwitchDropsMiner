@@ -45,8 +45,8 @@ from utils import (
 from constants import (
     CALL,
     MAX_INT,
-    DUMP_PATH,
-    COOKIES_PATH,
+    DEFAULT_PATHS,
+    AccountPaths,
     MAX_CHANNELS,
     GQL_QUERIES,
     WATCH_INTERVAL,
@@ -107,7 +107,7 @@ class _AuthState:
             if session is not None:
                 jar = cast(aiohttp.CookieJar, session.cookie_jar)
                 jar.clear()
-                COOKIES_PATH.unlink(missing_ok=True)
+                self._twitch.paths.cookies.unlink(missing_ok=True)
 
     def clear(self) -> None:
         self._delattrs(
@@ -493,7 +493,7 @@ class _AuthState:
                 # otherwise, we need to delete the entire cookie file and clear the jar
                 logger.info("Cookie client ID mismatch")
                 jar.clear()
-                COOKIES_PATH.unlink(missing_ok=True)
+                self._twitch.paths.cookies.unlink(missing_ok=True)
             else:
                 raise RuntimeError("Login verification failure (step #1)")
             self.user_id = int(validate_response["user_id"])
@@ -502,14 +502,17 @@ class _AuthState:
             login_form.update(_("gui", "login", "logged_in"), self.user_id)
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
-            jar.save(COOKIES_PATH)
+            jar.save(self._twitch.paths.cookies)
         self._twitch.gui.help._invalidate_button.config(state="normal")
         self._logged_in.set()
 
 
 class Twitch:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, paths: AccountPaths | None = None):
         self.settings: Settings = settings
+        # Per-account file layout. Never read a module-level path here - several
+        # clients run concurrently in one process and would stomp on each other.
+        self.paths: AccountPaths = paths if paths is not None else DEFAULT_PATHS
         # State management
         self._state: State = State.IDLE
         self._state_change = asyncio.Event()
@@ -525,8 +528,9 @@ class Twitch:
         self._client_type: ClientInfo = ClientType.ANDROID_APP
         self._session: aiohttp.ClientSession | None = None
         self._auth_state: _AuthState = _AuthState(self)
-        # GUI
-        self.gui = GUIManager(self)
+        # GUI - attached later by the shell, once the account's tab exists.
+        # Every `self.gui.x` access below stays valid through the property.
+        self._gui: GUIManager | None = None
         # Storing and watching channels
         self.channels: OrderedDict[int, Channel] = OrderedDict()
         self.watching_channel: AwaitableValue[Channel] = AwaitableValue()
@@ -537,6 +541,18 @@ class Twitch:
         # Maintenance task
         self._mnt_task: asyncio.Task[None] | None = None
 
+    @property
+    def gui(self) -> GUIManager:
+        if self._gui is None:
+            raise RuntimeError(
+                "GUI manager is not attached - the shell must build the account's tab first"
+            )
+        return self._gui
+
+    @gui.setter
+    def gui(self, value: GUIManager) -> None:
+        self._gui = value
+
     async def get_session(self) -> aiohttp.ClientSession:
         if (session := self._session) is not None:
             if session.closed:
@@ -545,8 +561,8 @@ class Twitch:
         # load in cookies
         cookie_jar = aiohttp.CookieJar()
         try:
-            if COOKIES_PATH.exists():
-                cookie_jar.load(COOKIES_PATH)
+            if self.paths.cookies.exists():
+                cookie_jar.load(self.paths.cookies)
         except Exception:
             # if loading in the cookies file ends up in an error, just ignore it
             # clear the jar, just in case
@@ -591,7 +607,7 @@ class Twitch:
             for cookie_key, cookie in list(cookie_jar._cookies.items()):
                 if not cookie:
                     del cookie_jar._cookies[cookie_key]
-            cookie_jar.save(COOKIES_PATH)
+            cookie_jar.save(self.paths.cookies)
             await self._session.close()
             self._session = None
         self._drops.clear()
@@ -668,7 +684,8 @@ class Twitch:
 
     async def run(self):
         if self.settings.dump:
-            with open(DUMP_PATH, 'w', encoding="utf8"):
+            self.paths.ensure()
+            with open(self.paths.dump, 'w', encoding="utf8"):
                 # replace the existing file with an empty one
                 pass
         while True:
@@ -1533,7 +1550,7 @@ class Twitch:
 
         if self.settings.dump:
             # dump the campaigns data to the dump file
-            with open(DUMP_PATH, 'a', encoding="utf8") as file:
+            with open(self.paths.dump, 'a', encoding="utf8") as file:
                 # we need to pre-process the inventory dump a little
                 dump_data: JsonType = deepcopy(inventory_data)
                 for campaign_data in dump_data.values():
