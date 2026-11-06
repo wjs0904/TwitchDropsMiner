@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from tkinter.font import Font, nametofont
 from functools import partial, cached_property
 from datetime import datetime, timedelta, timezone
-from tkinter import Tk, ttk, StringVar, DoubleVar, IntVar
+from tkinter import Tk, ttk, messagebox, StringVar, DoubleVar, IntVar
 from typing import Any, Union, Tuple, TypedDict, NoReturn, Generic, TYPE_CHECKING
 
 import pystray
@@ -37,6 +37,14 @@ from translate import _
 from cache import ImageCache
 from exceptions import MinerException, ExitRequest
 from utils import resource_path, set_root_icon, webopen, task_wrapper, Game, _T
+from accounts import (
+    CURRENT_ACCOUNT,
+    REGISTRY_PATH,
+    AccountEntry,
+    load_registry_all,
+    save_registry,
+    validate_name,
+)
 from constants import (
     MAX_INT,
     SELF_PATH,
@@ -65,6 +73,10 @@ logger = logging.getLogger("TwitchDrops")
 TK_PADDING = Union[int, Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int, int]]
 DIGITS = ceil(log10(WS_TOPICS_LIMIT))
 
+# ttk.Style is shared by the whole process, so the layout surgery below must run
+# only once no matter how many accounts construct a GUIManager.
+_STYLE_SURGERY_DONE: bool = False
+
 
 ######################
 # GUI ELEMENTS START #
@@ -72,11 +84,26 @@ DIGITS = ceil(log10(WS_TOPICS_LIMIT))
 
 
 class _TKOutputHandler(logging.Handler):
-    def __init__(self, output: GUIManager):
+    """
+    Routes log records into one account's console widget.
+
+    Every account installs its own handler on the same "TwitchDrops" logger, so
+    without a filter each record would be printed N times, once per account.
+    `CURRENT_ACCOUNT` is set inside the account's own task context, which makes
+    the routing exact: a record emitted from account A's coroutine carries "A"
+    and only A's handler accepts it. Records emitted outside any account task
+    (startup, the shell, shutdown) carry "" and are broadcast to all consoles.
+    """
+
+    def __init__(self, output: GUIManager, account: str = ""):
         super().__init__()
         self._output = output
+        self._account = account
 
     def emit(self, record):
+        current = CURRENT_ACCOUNT.get()
+        if current and self._account and current != self._account:
+            return
         self._output.print(self.format(record))
 
 
@@ -1205,6 +1232,84 @@ class TrayIcon:
             self.icon.icon = self._icon_images[state]
 
 
+class SharedTray:
+    """
+    Per-account handle onto the one process-wide pystray icon.
+
+    pystray runs its own message loop on a worker thread and there is no sane way
+    to run several icons, so the first account creates the real `TrayIcon` and
+    every account (including the first) talks to it through this proxy. Only the
+    account whose tab is currently selected is allowed to change the icon image
+    and the tooltip, otherwise N accounts would fight over the title bar text.
+    """
+
+    def __init__(self, manager: GUIManager, icon: TrayIcon):
+        self._manager = manager
+        self._icon = icon
+        self._title: str = TrayIcon.TITLE
+        self._icon_state: str = "pickaxe"
+
+    @property
+    def _active(self) -> bool:
+        shell = self._manager._shell
+        return shell is None or getattr(shell, "active_gui", None) is self._manager
+
+    # -- window level operations are shared, delegate as-is -----------------
+    def minimize(self):
+        self._icon.minimize()
+
+    def restore(self):
+        self._icon.restore()
+
+    def stop(self):
+        self._icon.stop()
+
+    def quit(self):
+        self._manager.close()
+
+    def _start(self):
+        self._icon._start()
+
+    @property
+    def icon(self):
+        return self._icon.icon
+
+    # -- per-account state -------------------------------------------------
+    def update_title(self, drop: TimedDrop | None):
+        self._title = self._icon.get_title(drop)
+        if self._active and self._icon.icon is not None:
+            self._icon.icon.title = self._title
+
+    def change_icon(self, state: str):
+        if state not in self._icon._icon_images:
+            raise ValueError("Invalid icon state")
+        self._icon_state = state
+        if self._active:
+            self._icon.change_icon(state)
+
+    def resync(self):
+        """Push this account's title/icon after it became the active tab."""
+        self.change_icon(self._icon_state)
+        if self._icon.icon is not None:
+            self._icon.icon.title = self._title
+
+    def notify(
+        self, message: str, title: str | None = None, duration: float = 10
+    ) -> asyncio.Task[None] | None:
+        if not self._manager._twitch.settings.tray_notifications:
+            return None
+        icon = self._icon.icon
+        if icon is None:
+            return None
+
+        async def notifier():
+            icon.notify(message, title)
+            await asyncio.sleep(duration)
+            icon.remove_notification()
+
+        return asyncio.create_task(notifier())
+
+
 class Notebook:
     def __init__(self, manager: GUIManager, master: ttk.Widget):
         self._nb = ttk.Notebook(master)
@@ -1569,6 +1674,189 @@ class _SettingsVars(TypedDict):
     available_drops_check: IntVar
 
 
+class AccountManagerDialog:
+    """
+    Small modal window for editing `accounts.json`.
+
+    The running process has already built its tabs, so nothing here restarts
+    an account - the dialog only rewrites the registry and tells the user to
+    restart. That keeps the UI honest: the tab list never silently diverges
+    from what is actually running.
+    """
+
+    def __init__(self, manager: GUIManager):
+        self._manager = manager
+        root = manager._root
+        self._entries: list[AccountEntry] = load_registry_all()
+        if not self._entries:
+            self._entries = [AccountEntry("default")]
+        self._dirty: bool = False
+
+        self._win = win = tk.Toplevel(root)
+        win.title(_("gui", "accounts", "manage"))
+        win.transient(root)
+        win.resizable(False, False)
+        win.columnconfigure(0, weight=1)
+
+        body = ttk.Frame(win, padding=8)
+        body.grid(column=0, row=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text=_("gui", "accounts", "list")).grid(
+            column=0, row=0, sticky="w", pady=(0, 4)
+        )
+
+        list_frame = ttk.Frame(body)
+        list_frame.grid(column=0, row=1, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        self._list = PaddedListbox(
+            list_frame, height=8, width=34, padding=(1, 0),
+            activestyle="none", selectmode="single",
+            highlightthickness=0, exportselection=False,
+        )
+        self._list.grid(column=0, row=0, sticky="nsew")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._list.yview)
+        scroll.grid(column=1, row=0, sticky="ns")
+        self._list.configure(yscrollcommand=scroll.set)
+        self._list.bind("<<ListboxSelect>>", lambda _e: self._sync_buttons())
+
+        btn_frame = ttk.Frame(body)
+        btn_frame.grid(column=0, row=2, sticky="ew", pady=(6, 0))
+        self._toggle_btn = ttk.Button(
+            btn_frame, text=_("gui", "accounts", "enable"), command=self._toggle
+        )
+        self._toggle_btn.grid(column=0, row=0, sticky="w")
+        self._remove_btn = ttk.Button(
+            btn_frame, text=_("gui", "accounts", "remove"), command=self._remove
+        )
+        self._remove_btn.grid(column=1, row=0, padx=4, sticky="w")
+
+        add_frame = ttk.Frame(body)
+        add_frame.grid(column=0, row=3, sticky="ew", pady=(8, 0))
+        add_frame.columnconfigure(0, weight=1)
+        self._new_name = StringVar(win, "")
+        entry = ttk.Entry(add_frame, textvariable=self._new_name, width=24)
+        entry.grid(column=0, row=0, sticky="ew")
+        entry.bind("<Return>", lambda _e: self._add())
+        ttk.Button(add_frame, text=_("gui", "accounts", "add"), command=self._add).grid(
+            column=1, row=0, padx=(4, 0)
+        )
+
+        self._status = ttk.Label(body, text="", foreground="red", wraplength=280)
+        self._status.grid(column=0, row=4, sticky="w", pady=(6, 0))
+
+        ttk.Label(
+            body, text=_("gui", "accounts", "restart_hint"), foreground="goldenrod",
+            wraplength=280,
+        ).grid(column=0, row=5, sticky="w", pady=(4, 0))
+
+        ttk.Button(body, text=_("gui", "accounts", "close"), command=self._close).grid(
+            column=0, row=6, sticky="e", pady=(8, 0)
+        )
+
+        self._refresh()
+        win.protocol("WM_DELETE_WINDOW", self._close)
+        win.bind("<Escape>", lambda _e: self._close())
+        win.grab_set()
+        entry.focus_set()
+
+    # -- helpers ---------------------------------------------------------
+    def _refresh(self) -> None:
+        current = self._list.curselection()
+        keep = current[0] if current else 0
+        self._list.delete(0, "end")
+        for entry in self._entries:
+            mark = "✓" if entry.enabled else "✗"
+            self._list.insert(
+                "end", f" {mark}  {entry.name}" + ("" if entry.enabled else "  (off)")
+            )
+        if self._entries:
+            idx = min(keep, len(self._entries) - 1)
+            self._list.selection_set(idx)
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        sel = self._list.curselection()
+        entry = self._entries[sel[0]] if sel else None
+        self._toggle_btn.state(["!disabled"] if entry else ["disabled"])
+        self._remove_btn.state(["!disabled"] if entry else ["disabled"])
+        if entry is not None:
+            # the button always offers the opposite of the current state
+            self._toggle_btn.configure(
+                text=_("gui", "accounts", "disable" if entry.enabled else "enable")
+            )
+
+    def _say(self, message: str) -> None:
+        self._status.configure(text=message)
+
+    def _persist(self) -> None:
+        save_registry(self._entries)
+        self._dirty = True
+
+    # -- actions ---------------------------------------------------------
+    def _add(self) -> None:
+        raw = self._new_name.get().strip()
+        if not raw:
+            self._say(_("gui", "accounts", "empty"))
+            return
+        try:
+            name = validate_name(raw)
+        except ValueError:
+            self._say(_("gui", "accounts", "invalid"))
+            return
+        if any(e.name.casefold() == name.casefold() for e in self._entries):
+            self._say(_("gui", "accounts", "invalid"))
+            return
+        self._entries.append(AccountEntry(name))
+        self._new_name.set("")
+        self._say("")
+        self._persist()
+        self._refresh()
+        self._list.selection_clear(0, "end")
+        self._list.selection_set(len(self._entries) - 1)
+
+    def _toggle(self) -> None:
+        sel = self._list.curselection()
+        if not sel:
+            return
+        entry = self._entries[sel[0]]
+        enabled_count = sum(1 for e in self._entries if e.enabled)
+        if entry.enabled and enabled_count <= 1:
+            self._say(_("gui", "accounts", "last_account"))
+            return
+        entry.enabled = not entry.enabled
+        self._say("")
+        self._persist()
+        self._refresh()
+
+    def _remove(self) -> None:
+        sel = self._list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        entry = self._entries[idx]
+        if len(self._entries) <= 1:
+            self._say(_("gui", "accounts", "last_account"))
+            return
+        if not messagebox.askyesno(
+            _("gui", "accounts", "manage"),
+            _("gui", "accounts", "confirm_remove").format(name=entry.name),
+            parent=self._win,
+        ):
+            return
+        del self._entries[idx]
+        self._say("")
+        self._persist()
+        self._refresh()
+
+    def _close(self) -> None:
+        try:
+            self._win.grab_release()
+        except tk.TclError:
+            pass
+        self._win.destroy()
+
+
 class SettingsPanel:
     AUTOSTART_NAME: str = "TwitchDropsMiner"
     AUTOSTART_KEY: str = "HKCU/Software/Microsoft/Windows/CurrentVersion/Run"
@@ -1844,6 +2132,14 @@ class SettingsPanel:
             text=_("gui", "settings", "reload"),
             command=self._manager._twitch.state_change(State.INVENTORY_FETCH),
         ).grid(column=1, row=0)
+        ttk.Button(
+            reload_frame,
+            text=_("gui", "accounts", "manage"),
+            command=self.manage_accounts,
+        ).grid(column=2, row=0, padx=(8, 0))
+
+    def manage_accounts(self) -> None:
+        AccountManagerDialog(self._manager)
 
     def clear_selection(self) -> None:
         self._priority_list.selection_clear(0, "end")
@@ -2206,17 +2502,24 @@ class HelpTab:
 
 
 class GUIManager:
-    def __init__(self, twitch: Twitch):
+    def __init__(self, twitch: Twitch, *, shell: Any = None, master: Any = None):
         self._twitch: Twitch = twitch
         self._poll_task: asyncio.Task[NoReturn] | None = None
         self._close_requested = asyncio.Event()
-        self._root = root = Tk(className=WINDOW_TITLE)
-        # withdraw immediately to prevent the window from flashing
-        self._root.withdraw()
-        # root.resizable(False, True)
-        set_root_icon(root, resource_path("icons/pickaxe.ico"))
-        root.title(WINDOW_TITLE)  # window title
-        root.bind_all("<KeyPress-Escape>", self.unfocus)  # pressing ESC unfocuses selection
+        # In shell mode the Tk root, the event pump, the tray icon and the
+        # window-level message hook all belong to the shell, not to the account.
+        self._shell = shell
+        self._container = master
+        if shell is not None:
+            self._root = root = shell.root
+        else:
+            self._root = root = Tk(className=WINDOW_TITLE)
+            # withdraw immediately to prevent the window from flashing
+            self._root.withdraw()
+            # root.resizable(False, True)
+            set_root_icon(root, resource_path("icons/pickaxe.ico"))
+            root.title(WINDOW_TITLE)  # window title
+            root.bind_all("<KeyPress-Escape>", self.unfocus)  # pressing ESC unfocuses selection
         # Image cache for displaying images
         self._cache = ImageCache(self)
 
@@ -2235,7 +2538,13 @@ class GUIManager:
         # add padding to the tab names
         style.configure("TNotebook.Tab", padding=[8, 4])
         # Skip these for classic theme or macOS
-        if theme != "classic" and sys.platform != "darwin":
+        # NOTE: ttk.Style is process-wide and this surgery is NOT idempotent -
+        # a second pass looks for a nested 'children' key that the first pass
+        # already removed, raising KeyError. With several accounts each building
+        # its own GUIManager, it must therefore run exactly once per process.
+        global _STYLE_SURGERY_DONE
+        if theme != "classic" and sys.platform != "darwin" and not _STYLE_SURGERY_DONE:
+            _STYLE_SURGERY_DONE = True
             # remove Notebook.focus from the Notebook.Tab layout tree to avoid an ugly dotted line
             # on tab selection. We fold the Notebook.focus children into Notebook.padding children.
             original = style.layout("TNotebook.Tab")
@@ -2257,14 +2566,20 @@ class GUIManager:
         self._fonts: dict[str, Font] = {}
         # end of style changes
 
-        root_frame = ttk.Frame(root, padding=8)
+        parent = self._container if self._container is not None else root
+        root_frame = ttk.Frame(parent, padding=8)
         root_frame.grid(column=0, row=0, sticky="nsew")
-        root.rowconfigure(0, weight=1)
-        root.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
         # Notebook
         self.tabs = Notebook(self, root_frame)
-        # Tray icon - place after notebook so it draws on top of the tabs space
-        self.tray = TrayIcon(self, root_frame)
+        # Tray icon - place after notebook so it draws on top of the tabs space.
+        # Exactly one pystray icon may exist per process, so the shell owns it.
+        if shell is not None:
+            icon = shell.ensure_tray_icon(lambda: TrayIcon(self, root_frame))
+            self.tray = SharedTray(self, icon)
+        else:
+            self.tray = TrayIcon(self, root_frame)
         # Main tab
         main_frame = ttk.Frame(root_frame, padding=8)
         self.tabs.add_tab(main_frame, name=_("gui", "tabs", "main"))
@@ -2287,17 +2602,23 @@ class GUIManager:
         self.help = HelpTab(self, help_frame)
         self.tabs.add_tab(help_frame, name=_("gui", "tabs", "help"))
         # clamp minimum window size (update geometry first)
-        root.update_idletasks()
-        root.minsize(width=root.winfo_reqwidth(), height=root.winfo_reqheight())
-        # register logging handler
-        self._handler = _TKOutputHandler(self)
+        if shell is None:
+            # NOTE: with several accounts this would freeze the window at the
+            # first account's requested size; the shell owns sizing instead.
+            root.update_idletasks()
+            root.minsize(width=root.winfo_reqwidth(), height=root.winfo_reqheight())
+        # register logging handler, scoped to this account
+        self._handler = _TKOutputHandler(self, twitch.paths.name)
         self._handler.setFormatter(OUTPUT_FORMATTER)
         logger = logging.getLogger("TwitchDrops")
         logger.addHandler(self._handler)
         if (logging_level := logger.getEffectiveLevel()) < logging.ERROR:
             self.print(f"Logging level: {logging.getLevelName(logging_level)}")
         # gracefully handle Windows shutdown closing the application
-        if sys.platform == "win32":
+        if shell is not None:
+            # the shell installs the window procedure on the shared root
+            pass
+        elif sys.platform == "win32":
             # NOTE: this root.update() is required for the below to work - don't remove
             root.update()
             self._message_map = {
@@ -2327,7 +2648,10 @@ class GUIManager:
             self._orig_theme_name = ''
         self.apply_theme(self._twitch.settings.dark_mode)
         # stay hidden in tray if needed, otherwise show the window when everything's ready
-        if self._twitch.settings.tray and sys.platform != "darwin":
+        if shell is not None:
+            # the shell decides when the shared window is shown or hidden
+            pass
+        elif self._twitch.settings.tray and sys.platform != "darwin":
             # NOTE: this starts the tray icon thread
             self._root.after_idle(self.tray.minimize)
         else:
@@ -2391,12 +2715,18 @@ class GUIManager:
         self._close_requested.clear()
 
     def start(self):
-        if self._poll_task is None:
+        if self._shell is not None:
+            # One Tk event queue exists per process; pumping it once per account
+            # would run several identical loops over the same queue.
+            self._shell.start_poll()
+        elif self._poll_task is None:
             self._poll_task = asyncio.create_task(self._poll())
         # self.progress.start_timer()
 
     def stop(self):
         self.progress.stop_timer()
+        if self._shell is not None:
+            return
         if self._poll_task is not None:
             self._poll_task.cancel()
             self._poll_task = None
@@ -2441,9 +2771,15 @@ class GUIManager:
     def close_window(self):
         """
         Closes the window. Invalidates the logger.
+
+        In shell mode only this account's widgets go away - the shared root stays
+        alive until the shell tears the whole application down.
         """
-        self.tray.stop()
         logging.getLogger("TwitchDrops").removeHandler(self._handler)
+        if self._shell is not None:
+            self._shell.detach_account(self)
+            return
+        self.tray.stop()
         self._root.destroy()
 
     def unfocus(self, event):
