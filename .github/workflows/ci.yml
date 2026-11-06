@@ -404,13 +404,41 @@ jobs:
             **Highlights**
 
             - Run several Twitch accounts in one window, one tab per account.
+            - Add an account at runtime from the **+** tab in the tab strip - it
+              gets its own proxy, starts mining immediately, no restart.
             - Every account keeps its own `cookies.jar`, `settings.json`, `cache/`
               and `log.txt`; nothing is shared, so a login can never leak between
               accounts.
             - The account list lives in `accounts.json` next to the executable and
-              can be edited from **设置 → 管理账户**.
+              can be edited from **设置 → 管理账户**, including each account's proxy.
             - The interface is fully translated to 简体中文, which is now the
               default language.
+
+            **One exit IP per account (`proxies.txt`)**
+
+            The point of multi-account is defeated if every account leaves from the
+            same address, so this build can pin each account to its own upstream
+            proxy. Put one proxy per line in `proxies.txt` next to the executable:
+
+            ```
+            http://127.0.0.1:7901
+            http://127.0.0.1:7902
+            ```
+
+            The binding is written into `accounts.json` and stays put across
+            restarts - a stable exit is worth more than a rotating one. If the pool
+            runs out, the remaining accounts **refuse to start** rather than fall
+            back to a direct connection: leaking your real IP is worse than not
+            mining. A dead proxy puts the account on hold with a red notice naming
+            the proxy, and it never silently goes direct.
+
+            **Clash / mihomo users: a port alone is not a distinct exit.** Every
+            connection through any `mixed-port` still leaves through whatever the
+            rules pick, so N ports share one IP. What pins an exit is the `proxy`
+            field of a `listener`, which bypasses the rules. See `PROXY.md` for the
+            working configuration, and verify every port with
+            `curl -x http://127.0.0.1:PORT https://api.ipify.org` - a node with
+            "Fixed" in its name can still share a NAT with another one.
 
             **Upgrading from upstream**
 
@@ -424,7 +452,18 @@ jobs:
             ```
 
             Each name becomes `accounts/<name>/` next to the executable; the first
-            name in the list opens as the visible tab.
+            name in the list opens as the visible tab. Existing `settings.json`,
+            `cookies.jar` and `cache/` in the program directory belong to the
+            `default` account, so an in-place upgrade keeps you logged in.
+
+            **Also in this build**
+
+            - The console log is capped at 5000 lines and the image cache is
+              bounded, so a long session no longer grows without limit.
+            - Subscribe overflow no longer aborts the run; it drops the
+              lowest-priority channels and warns.
+            - A failing proxy is reported as a proxy failure, not as a generic
+              connection error.
           name: "Twitch Drops Miner ${{steps.vars.outputs.app_version}} (multi-account)"
           prerelease: false
           removeArtifacts: true
